@@ -1,0 +1,1 @@
+python .\scripts\fetch_player_details.py --player-id 34182007 --write-json --write-csv -v
