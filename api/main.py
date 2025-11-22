@@ -37,13 +37,23 @@ from psycopg2.extras import RealDictCursor
 
 load_dotenv()  # locally; no-op on Render
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Fallback DB URL for Render if DATABASE_URL env var is missing.
+# (You said this is temporary and will be rotated later.)
+DEFAULT_DB_URL = (
+    "postgresql://rugby_analytics_user:"
+    "a5tDWnLOBdGEqSQGEcEjfiXaSbIlFksT"
+    "@dpg-d4grdqili9vc73dqbtf0-a.oregon-postgres.render.com"
+    "/rugby_analytics"
+)
+
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    # RealDictCursor returns rows as dicts, which is easier to turn into JSON
+    """
+    Always try to connect using DATABASE_URL if set,
+    otherwise fall back to DEFAULT_DB_URL.
+    """
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
