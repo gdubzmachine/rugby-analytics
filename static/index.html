@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Rugby Analytics – Head to Head</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #0b1020;
+      color: #f5f5f5;
+    }
+    header {
+      padding: 16px 24px;
+      background: #111827;
+      border-bottom: 1px solid #1f2933;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.4rem;
+    }
+    header p {
+      margin: 4px 0 0;
+      font-size: 0.9rem;
+      color: #9ca3af;
+    }
+    main {
+      max-width: 1100px;
+      margin: 24px auto 40px;
+      padding: 0 16px;
+    }
+    .card {
+      background: #111827;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      border: 1px solid #1f2937;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.1rem;
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      margin-bottom: 4px;
+      color: #d1d5db;
+    }
+    input, select, button {
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    input, select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #f9fafb;
+      outline: none;
+    }
+    input:focus, select:focus {
+      border-color: #3b82f6;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    button {
+      margin-top: 8px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: none;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    button:disabled {
+      background: #374151;
+      cursor: wait;
+    }
+    .error {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      color: #fecaca;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 8px;
+    }
+    .summary-box {
+      background: #020617;
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid #1f2937;
+    }
+    .summary-box h3 {
+      margin: 0 0 4px;
+      font-size: 0.9rem;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .summary-box .value {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .summary-box .sub {
+      font-size: 0.85rem;
+      color: #9ca3af;
+      margin-top: 2px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #1f2933;
+      text-align: left;
+    }
+    th {
+      font-weight: 500;
+      color: #9ca3af;
+      background: #020617;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tr:nth-child(even) td {
+      background: #020617;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+    }
+    .pill-win {
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+    }
+    .pill-loss {
+      background: rgba(248, 113, 113, 0.15);
+      color: #fca5a5;
+    }
+    .pill-draw {
+      background: rgba(251, 191, 36, 0.15);
+      color: #facc15;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rugby Analytics – Head-to-Head</h1>
+    <p>Compare two teams in the same league: last matches, win rates, and current streak.</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Compare Teams</h2>
+      <form id="h2h-form">
+        <div class="form-row">
+          <div>
+            <label for="league-id">League (TSDB ID)</label>
+            <input id="league-id" type="number" value="4446" />
+            <div class="small">4446 = URC (United Rugby Championship)</div>
+          </div>
+          <div>
+            <label for="team-a">Team A</label>
+            <input id="team-a" type="text" placeholder="e.g. Bulls" />
+          </div>
+          <div>
+            <label for="team-b">Team B</label>
+            <input id="team-b" type="text" placeholder="e.g. Leinster" />
+          </div>
+          <div>
+            <label for="limit">Last N matches</label>
+            <select id="limit">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" id="submit-btn">Compare</button>
+        <div id="error" class="error" style="display:none;"></div>
+      </form>
+    </section>
+
+    <section class="card" id="results-card" style="display:none;">
+      <h2 id="results-title">Head-to-Head Results</h2>
+      <div class="summary-grid">
+        <div class="summary-box">
+          <h3>Teams</h3>
+          <div class="value" id="teams-label"></div>
+          <div class="sub" id="league-label"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Overall Record</h3>
+          <div class="value" id="overall-record"></div>
+          <div class="sub" id="overall-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Win Rates</h3>
+          <div class="value" id="win-rates"></div>
+          <div class="sub" id="win-rates-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Current Streak</h3>
+          <div class="value" id="streak"></div>
+          <div class="sub" id="streak-extra"></div>
+        </div>
+      </div>
+
+      <h3 style="margin-top:16px;">Last Matches</h3>
+      <div class="small" id="last-n-label"></div>
+      <div style="max-height:320px; overflow-y:auto; margin-top:4px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Season</th>
+              <th>Match</th>
+              <th>Score</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="matches-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    function formatDate(iso) {
+      if (!iso) return "-";
+      try {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return "-";
+        return d.toISOString().slice(0, 10);
+      } catch {
+        return "-";
+      }
+    }
+
+    function percent(n) {
+      return (n * 100).toFixed(1) + "%";
+    }
+
+    function winnerLabel(row, teamAName, teamBName) {
+      if (!row.home_score && row.home_score !== 0) return "No score";
+      if (!row.away_score && row.away_score !== 0) return "No score";
+
+      if (row.home_score > row.away_score) {
+        if (row.home_team_name === teamAName) return teamAName + " win";
+        if (row.home_team_name === teamBName) return teamBName + " win";
+        return row.home_team_name + " win";
+      } else if (row.away_score > row.home_score) {
+        if (row.away_team_name === teamAName) return teamAName + " win";
+        if (row.away_team_name === teamBName) return teamBName + " win";
+        return row.away_team_name + " win";
+      } else {
+        return "Draw";
+      }
+    }
+
+    function resultPillClass(row, teamAName, teamBName) {
+      if (row.home_score == null || row.away_score == null) return "";
+      if (row.home_score === row.away_score) return "pill pill-draw";
+
+      const label = winnerLabel(row, teamAName, teamBName);
+      if (label.startsWith(teamAName)) return "pill pill-win";
+      if (label.startsWith(teamBName)) return "pill pill-loss";
+      return "pill";
+    }
+
+    document.getElementById("h2h-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      const leagueId = document.getElementById("league-id").value.trim();
+      const teamA = document.getElementById("team-a").value.trim();
+      const teamB = document.getElementById("team-b").value.trim();
+      const limit = document.getElementById("limit").value;
+
+      const errorEl = document.getElementById("error");
+      const btn = document.getElementById("submit-btn");
+      const resultsCard = document.getElementById("results-card");
+      const matchesBody = document.getElementById("matches-body");
+
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+      resultsCard.style.display = "none";
+      matchesBody.innerHTML = "";
+
+      if (!leagueId || !teamA || !teamB) {
+        errorEl.textContent = "Please fill in league ID, Team A, and Team B.";
+        errorEl.style.display = "block";
+        return;
+      }
+
+      btn.disabled = true;
+
+      try {
+        const params = new URLSearchParams({
+          team_a: teamA,
+          team_b: teamB,
+          limit: String(limit),
+        });
+
+        const url = `/headtohead/${encodeURIComponent(leagueId)}?` + params.toString();
+        const res = await fetch(url);
+
+        if (!res.ok) {
+          let msg = `Error ${res.status}`;
+          try {
+            const data = await res.json();
+            if (data.detail) msg = data.detail;
+          } catch {}
+          throw new Error(msg);
+        }
+
+        const data = await res.json();
+
+        // Summary top section
+        document.getElementById("results-title").textContent =
+          `Head-to-head: ${data.team_a_name} vs ${data.team_b_name}`;
+        document.getElementById("teams-label").textContent =
+          `${data.team_a_name} vs ${data.team_b_name}`;
+        document.getElementById("league-label").textContent =
+          `${data.league_name} (TSDB ${data.tsdb_league_id})`;
+
+        document.getElementById("overall-record").textContent =
+          `${data.team_a_wins} – ${data.team_b_wins} (W–L)`;
+        document.getElementById("overall-extra").textContent =
+          `${data.draws} draw(s) across ${data.total_matches} matches`;
+
+        document.getElementById("win-rates").textContent =
+          `${percent(data.team_a_win_rate)} vs ${percent(data.team_b_win_rate)}`;
+        document.getElementById("win-rates-extra").textContent =
+          `${data.team_a_name} vs ${data.team_b_name}`;
+
+        let streakText = "No streak data";
+        if (data.current_streak_type === "team_a_win") {
+          streakText = `${data.team_a_name} – ${data.current_streak_length} win(s) in a row`;
+        } else if (data.current_streak_type === "team_b_win") {
+          streakText = `${data.team_b_name} – ${data.current_streak_length} win(s) in a row`;
+        } else if (data.current_streak_type === "draw") {
+          streakText = `${data.current_streak_length} draw(s) in a row`;
+        }
+        document.getElementById("streak").textContent = streakText;
+        document.getElementById("streak-extra").textContent =
+          "Based on most recent head-to-head matches";
+
+        document.getElementById("last-n-label").textContent =
+          `Showing up to ${data.last_n.length} most recent matches between these teams.`;
+
+        // Table of matches
+        for (const row of data.last_n) {
+          const tr = document.createElement("tr");
+
+          const tdDate = document.createElement("td");
+          tdDate.textContent = formatDate(row.kickoff_utc);
+          tr.appendChild(tdDate);
+
+          const tdSeason = document.createElement("td");
+          tdSeason.textContent = row.season_label || "-";
+          tr.appendChild(tdSeason);
+
+          const tdMatch = document.createElement("td");
+          tdMatch.textContent = `${row.home_team_name} vs ${row.away_team_name}`;
+          tr.appendChild(tdMatch);
+
+          const tdScore = document.createElement("td");
+          if (row.home_score == null || row.away_score == null) {
+            tdScore.textContent = "-";
+          } else {
+            tdScore.textContent = `${row.home_score} – ${row.away_score}`;
+          }
+          tr.appendChild(tdScore);
+
+          const tdResult = document.createElement("td");
+          const pill = document.createElement("span");
+          pill.className = resultPillClass(row, data.team_a_name, data.team_b_name);
+          pill.textContent = winnerLabel(row, data.team_a_name, data.team_b_name);
+          tdResult.appendChild(pill);
+          tr.appendChild(tdResult);
+
+          matchesBody.appendChild(tr);
+        }
+
+        resultsCard.style.display = "block";
+      } catch (err) {
+        console.error(err);
+        errorEl.textContent = err.message || "Something went wrong.";
+        errorEl.style.display = "block";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

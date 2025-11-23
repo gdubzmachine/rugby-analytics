@@ -4,12 +4,13 @@
 api/main.py
 -----------
 
-Minimal FastAPI app for rugby analytics:
+FastAPI app for rugby analytics:
 
 - /health
 - /standings/{tsdb_league_id}
+- /headtohead/{tsdb_league_id}
 
-It expects the following tables (which we already created on Render):
+It expects the following tables:
 
 - sports
 - leagues (with tsdb_league_id)
@@ -18,13 +19,20 @@ It expects the following tables (which we already created on Render):
 - matches
 - team_season_stats
 
-It uses DATABASE_URL from the environment (.env locally, Render env vars in prod).
+It uses DATABASE_URL from the environment (.env locally, Render env vars in prod),
+falling back to a hard-coded Render URL for now.
 """
 
 import os
+from pathlib import Path
 from typing import List, Optional
 
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -38,7 +46,6 @@ from psycopg2.extras import RealDictCursor
 load_dotenv()  # locally; no-op on Render
 
 # Fallback DB URL for Render if DATABASE_URL env var is missing.
-# (You said this is temporary and will be rotated later.)
 DEFAULT_DB_URL = (
     "postgresql://rugby_analytics_user:"
     "a5tDWnLOBdGEqSQGEcEjfiXaSbIlFksT"
@@ -85,15 +92,63 @@ class StandingsResponse(BaseModel):
     rows: List[StandingRow]
 
 
+class MatchSummary(BaseModel):
+    match_id: int
+    season_label: str
+    kickoff_utc: Optional[datetime]
+    home_team_id: int
+    home_team_name: str
+    away_team_id: int
+    away_team_name: str
+    home_score: Optional[int]
+    away_score: Optional[int]
+    winner: Optional[str]
+
+
+class HeadToHeadResponse(BaseModel):
+    tsdb_league_id: int
+    league_name: str
+    team_a_id: int
+    team_a_name: str
+    team_b_id: int
+    team_b_name: str
+    total_matches: int
+    team_a_wins: int
+    team_b_wins: int
+    draws: int
+    team_a_win_rate: float
+    team_b_win_rate: float
+    current_streak_type: Optional[str]
+    current_streak_length: int
+    last_n: List[MatchSummary]
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Rugby Analytics API",
-    version="0.1.0",
-    description="Minimal API exposing rugby league standings from Postgres.",
+    version="0.2.0",
+    description="API exposing rugby standings and head-to-head stats.",
 )
+
+# Serve a simple UI from / (index.html in ./static)
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        return HTMLResponse(
+            "<h1>Rugby Analytics</h1><p>Static UI not found yet. "
+            "Create static/index.html on the server.</p>",
+            status_code=200,
+        )
+    return index_path.read_text(encoding="utf-8")
 
 
 @app.get("/health")
@@ -112,7 +167,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Helper functions for /standings
+# Helper functions
 # ---------------------------------------------------------------------------
 
 def _resolve_league(cur, tsdb_league_id: int) -> dict:
@@ -133,10 +188,10 @@ def _resolve_league(cur, tsdb_league_id: int) -> dict:
     return row
 
 
-def _resolve_season_label(cur, league_id: int, season_label: Optional[str], latest: bool) -> str:
+def _resolve_season_label(cur, league_id: int, season_label: Optional[str]) -> str:
     """
     If season_label is provided, validate it exists for this league.
-    If latest is True (or no season_label is provided), pick the max year.
+    If it is None, pick the latest season by year.
     """
     if season_label:
         cur.execute(
@@ -176,6 +231,36 @@ def _resolve_season_label(cur, league_id: int, season_label: Optional[str], late
     return row["label"]
 
 
+def _resolve_team_in_league(cur, league_id: int, name_query: str) -> dict:
+    """
+    Find a team in this league by fuzzy name match.
+    We restrict to teams that appear in team_season_stats for this league.
+    """
+    cur.execute(
+        """
+        SELECT DISTINCT t.team_id, t.name
+        FROM teams t
+        JOIN team_season_stats tss
+          ON tss.team_id = t.team_id
+        WHERE tss.league_id = %s
+          AND t.name ILIKE %s
+        ORDER BY t.name
+        """,
+        (league_id, f"%{name_query}%"),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No team found in league_id={league_id} matching '{name_query}'",
+        )
+    if len(rows) > 1:
+        # For now we just pick the first; UI can be improved later
+        # to handle multiple matches.
+        pass
+    return rows[0]
+
+
 # ---------------------------------------------------------------------------
 # /standings endpoint
 # ---------------------------------------------------------------------------
@@ -210,8 +295,7 @@ def get_standings(
         season_label_resolved = _resolve_season_label(
             cur,
             league_id=league_id,
-            season_label=season_label,
-            latest=latest or (season_label is None),
+            season_label=season_label if season_label else None,
         )
 
         # 3) Load the standings rows from team_season_stats
@@ -278,6 +362,199 @@ def get_standings(
             league_name=league_name,
             season_label=season_label_resolved,
             rows=standings,
+        )
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# /headtohead endpoint
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/headtohead/{tsdb_league_id}",
+    response_model=HeadToHeadResponse,
+)
+def get_headtohead(
+    tsdb_league_id: int,
+    team_a: str = Query(..., description="Name (or part) of Team A"),
+    team_b: str = Query(..., description="Name (or part) of Team B"),
+    limit: int = Query(10, ge=1, le=100, description="Number of recent matches to consider"),
+):
+    """
+    Head-to-head stats between two teams in a given league:
+
+    - Last N matches (up to `limit`)
+    - Total wins/draws
+    - Win rates
+    - Current streak in the matchup
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        # Resolve league
+        league = _resolve_league(cur, tsdb_league_id)
+        league_id = league["league_id"]
+        league_name = league["name"]
+
+        # Resolve teams (fuzzy match within this league)
+        team_a_row = _resolve_team_in_league(cur, league_id, team_a)
+        team_b_row = _resolve_team_in_league(cur, league_id, team_b)
+
+        team_a_id = team_a_row["team_id"]
+        team_a_name = team_a_row["name"]
+        team_b_id = team_b_row["team_id"]
+        team_b_name = team_b_row["name"]
+
+        # Load last N matches between these two teams in this league
+        cur.execute(
+            """
+            SELECT
+                m.match_id,
+                s.label AS season_label,
+                m.kickoff_utc,
+                ht.team_id AS home_team_id,
+                ht.name    AS home_team_name,
+                at.team_id AS away_team_id,
+                at.name    AS away_team_name,
+                m.home_score,
+                m.away_score
+            FROM matches m
+            JOIN seasons s ON s.season_id = m.season_id
+            JOIN teams ht ON ht.team_id = m.home_team_id
+            JOIN teams at ON at.team_id = m.away_team_id
+            WHERE m.league_id = %s
+              AND (
+                    (m.home_team_id = %s AND m.away_team_id = %s) OR
+                    (m.home_team_id = %s AND m.away_team_id = %s)
+                  )
+            ORDER BY m.kickoff_utc DESC
+            LIMIT %s
+            """,
+            (league_id, team_a_id, team_b_id, team_b_id, team_a_id, limit),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No matches found between '{team_a_name}' and '{team_b_name}' "
+                    f"in tsdb_league_id={tsdb_league_id}"
+                ),
+            )
+
+        # Compute stats
+        total_matches = 0
+        team_a_wins = 0
+        team_b_wins = 0
+        draws = 0
+        match_summaries: List[MatchSummary] = []
+
+        # For current streak we process from most recent backward
+        streak_type: Optional[str] = None  # "team_a_win", "team_b_win", "draw"
+        streak_length = 0
+
+        for idx, r in enumerate(rows):
+            total_matches += 1
+            hs = r["home_score"]
+            as_ = r["away_score"]
+
+            winner: Optional[str] = None
+            result_flag: Optional[str] = None
+
+            if hs is not None and as_ is not None:
+                if hs > as_:
+                    winner = "home"
+                elif as_ > hs:
+                    winner = "away"
+                else:
+                    winner = "draw"
+
+                # Map to team_a / team_b result
+                if winner == "draw":
+                    draws += 1
+                    result_flag = "draw"
+                else:
+                    home_is_a = (r["home_team_id"] == team_a_id)
+                    away_is_a = (r["away_team_id"] == team_a_id)
+
+                    if winner == "home":
+                        if home_is_a:
+                            team_a_wins += 1
+                            result_flag = "team_a_win"
+                        else:
+                            team_b_wins += 1
+                            result_flag = "team_b_win"
+                    elif winner == "away":
+                        if away_is_a:
+                            team_a_wins += 1
+                            result_flag = "team_a_win"
+                        else:
+                            team_b_wins += 1
+                            result_flag = "team_b_win"
+
+            # Build match summary
+            kickoff = r["kickoff_utc"]
+            if isinstance(kickoff, str):
+                try:
+                    kickoff = datetime.fromisoformat(kickoff)
+                except Exception:
+                    kickoff = None
+
+            match_summaries.append(
+                MatchSummary(
+                    match_id=r["match_id"],
+                    season_label=r["season_label"],
+                    kickoff_utc=kickoff,
+                    home_team_id=r["home_team_id"],
+                    home_team_name=r["home_team_name"],
+                    away_team_id=r["away_team_id"],
+                    away_team_name=r["away_team_name"],
+                    home_score=hs,
+                    away_score=as_,
+                    winner=winner,
+                )
+            )
+
+            # Update current streak (first rows are most recent)
+            if idx == 0:
+                # Initialize streak with first result
+                streak_type = result_flag
+                streak_length = 1 if result_flag is not None else 0
+            else:
+                if result_flag is not None and result_flag == streak_type:
+                    streak_length += 1
+                else:
+                    # streak broken
+                    break
+
+        # Compute win rates
+        if total_matches > 0:
+            team_a_win_rate = team_a_wins / total_matches
+            team_b_win_rate = team_b_wins / total_matches
+        else:
+            team_a_win_rate = 0.0
+            team_b_win_rate = 0.0
+
+        return HeadToHeadResponse(
+            tsdb_league_id=tsdb_league_id,
+            league_name=league_name,
+            team_a_id=team_a_id,
+            team_a_name=team_a_name,
+            team_b_id=team_b_id,
+            team_b_name=team_b_name,
+            total_matches=total_matches,
+            team_a_wins=team_a_wins,
+            team_b_wins=team_b_wins,
+            draws=draws,
+            team_a_win_rate=team_a_win_rate,
+            team_b_win_rate=team_b_win_rate,
+            current_streak_type=streak_type,
+            current_streak_length=streak_length,
+            last_n=match_summaries,
         )
 
     finally:
