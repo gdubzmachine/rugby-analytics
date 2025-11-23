@@ -7,8 +7,11 @@ api/main.py
 FastAPI app for rugby analytics:
 
 - /health
+- /leagues
+- /teams
 - /standings/{tsdb_league_id}
 - /headtohead/{tsdb_league_id}
+- /         (simple built-in UI for head-to-head)
 
 It expects the following tables:
 
@@ -24,13 +27,10 @@ falling back to a hard-coded Render URL for now.
 """
 
 import os
-from pathlib import Path
 from typing import List, Optional
-
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
 from pydantic import BaseModel
@@ -62,6 +62,576 @@ def get_conn():
     otherwise fall back to DEFAULT_DB_URL.
     """
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+# ---------------------------------------------------------------------------
+# Built-in UI HTML at "/"
+# ---------------------------------------------------------------------------
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Rugby Analytics – Head to Head</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #0b1020;
+      color: #f5f5f5;
+    }
+    header {
+      padding: 16px 24px;
+      background: #111827;
+      border-bottom: 1px solid #1f2933;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.4rem;
+    }
+    header p {
+      margin: 4px 0 0;
+      font-size: 0.9rem;
+      color: #9ca3af;
+    }
+    main {
+      max-width: 1100px;
+      margin: 24px auto 40px;
+      padding: 0 16px;
+    }
+    .card {
+      background: #111827;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      border: 1px solid #1f2937;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.1rem;
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      margin-bottom: 4px;
+      color: #d1d5db;
+    }
+    input, select, button {
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    input, select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #f9fafb;
+      outline: none;
+    }
+    input:focus, select:focus {
+      border-color: #3b82f6;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    button {
+      margin-top: 8px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: none;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    button:disabled {
+      background: #374151;
+      cursor: wait;
+    }
+    .error {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      color: #fecaca;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 8px;
+    }
+    .summary-box {
+      background: #020617;
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid #1f2937;
+    }
+    .summary-box h3 {
+      margin: 0 0 4px;
+      font-size: 0.9rem;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .summary-box .value {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .summary-box .sub {
+      font-size: 0.85rem;
+      color: #9ca3af;
+      margin-top: 2px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #1f2933;
+      text-align: left;
+    }
+    th {
+      font-weight: 500;
+      color: #9ca3af;
+      background: #020617;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tr:nth-child(even) td {
+      background: #020617;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+    }
+    .pill-win {
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+    }
+    .pill-loss {
+      background: rgba(248, 113, 113, 0.15);
+      color: #fca5a5;
+    }
+    .pill-draw {
+      background: rgba(251, 191, 36, 0.15);
+      color: #facc15;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rugby Analytics – Head-to-Head</h1>
+    <p>Compare two teams: last matches, win rates, and current streak.</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Compare Teams</h2>
+      <form id="h2h-form">
+        <div class="form-row">
+          <div>
+            <label for="league-select">League</label>
+            <select id="league-select">
+              <option value="">Loading leagues…</option>
+            </select>
+            <div class="small">
+              Leagues are loaded from your rugby_analytics DB.
+              Choose “All leagues” to combine all competitions.
+            </div>
+          </div>
+          <div>
+            <label for="team-a">Team A</label>
+            <input id="team-a" type="text" placeholder="e.g. Bulls" list="team-a-options" />
+            <datalist id="team-a-options"></datalist>
+          </div>
+          <div>
+            <label for="team-b">Team B</label>
+            <input id="team-b" type="text" placeholder="e.g. Leinster" list="team-b-options" />
+            <datalist id="team-b-options"></datalist>
+          </div>
+          <div>
+            <label for="limit">Last N matches</label>
+            <select id="limit">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" id="submit-btn">Compare</button>
+        <div id="error" class="error" style="display:none;"></div>
+      </form>
+    </section>
+
+    <section class="card" id="results-card" style="display:none;">
+      <h2 id="results-title">Head-to-Head Results</h2>
+      <div class="summary-grid">
+        <div class="summary-box">
+          <h3>Teams</h3>
+          <div class="value" id="teams-label"></div>
+          <div class="sub" id="league-label"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Overall Record</h3>
+          <div class="value" id="overall-record"></div>
+          <div class="sub" id="overall-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Win Rates</h3>
+          <div class="value" id="win-rates"></div>
+          <div class="sub" id="win-rates-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Current Streak</h3>
+          <div class="value" id="streak"></div>
+          <div class="sub" id="streak-extra"></div>
+        </div>
+      </div>
+
+      <h3 style="margin-top:16px;">Last Matches</h3>
+      <div class="small" id="last-n-label"></div>
+      <div style="max-height:320px; overflow-y:auto; margin-top:4px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Season</th>
+              <th>Match</th>
+              <th>Score</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="matches-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    function formatDate(iso) {
+      if (!iso) return "-";
+      try {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return "-";
+        return d.toISOString().slice(0, 10);
+      } catch {
+        return "-";
+      }
+    }
+
+    function percent(n) {
+      return (n * 100).toFixed(1) + "%";
+    }
+
+    function winnerLabel(row, teamAName, teamBName) {
+      if (row.home_score == null || row.away_score == null) return "No score";
+
+      if (row.home_score > row.away_score) {
+        if (row.home_team_name === teamAName) return teamAName + " win";
+        if (row.home_team_name === teamBName) return teamBName + " win";
+        return row.home_team_name + " win";
+      } else if (row.away_score > row.home_score) {
+        if (row.away_team_name === teamAName) return teamAName + " win";
+        if (row.away_team_name === teamBName) return teamBName + " win";
+        return row.away_team_name + " win";
+      } else {
+        return "Draw";
+      }
+    }
+
+    function resultPillClass(row, teamAName, teamBName) {
+      if (row.home_score == null || row.away_score == null) return "";
+      if (row.home_score === row.away_score) return "pill pill-draw";
+
+      const label = winnerLabel(row, teamAName, teamBName);
+      if (label.startsWith(teamAName)) return "pill pill-win";
+      if (label.startsWith(teamBName)) return "pill pill-loss";
+      return "pill";
+    }
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let msg = "Request failed: " + res.status;
+        try {
+          const data = await res.json();
+          if (data.detail) msg = data.detail;
+        } catch {}
+        throw new Error(msg);
+      }
+      return res.json();
+    }
+
+    function populateTeamsOptions(teams) {
+      const listA = document.getElementById("team-a-options");
+      const listB = document.getElementById("team-b-options");
+      listA.innerHTML = "";
+      listB.innerHTML = "";
+
+      teams.forEach((t) => {
+        const optA = document.createElement("option");
+        optA.value = t.name;
+        listA.appendChild(optA);
+
+        const optB = document.createElement("option");
+        optB.value = t.name;
+        listB.appendChild(optB);
+      });
+    }
+
+    async function loadTeamsForLeague(leagueId) {
+      const listA = document.getElementById("team-a-options");
+      const listB = document.getElementById("team-b-options");
+      listA.innerHTML = "";
+      listB.innerHTML = "";
+      document.getElementById("team-a").value = "";
+      document.getElementById("team-b").value = "";
+
+      if (!leagueId && leagueId !== 0 && leagueId !== "0") {
+        return;
+      }
+
+      try {
+        const url =
+          "/teams?limit=200" +
+          "&tsdb_league_id=" +
+          encodeURIComponent(leagueId);
+        const teams = await fetchJSON(url);
+        populateTeamsOptions(teams);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function loadLeagues() {
+      const select = document.getElementById("league-select");
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "Select league…";
+      select.appendChild(placeholder);
+
+      const allOption = document.createElement("option");
+      allOption.value = "0";
+      allOption.textContent = "All leagues";
+      select.appendChild(allOption);
+
+      try {
+        const leagues = await fetchJSON("/leagues");
+
+        leagues.forEach((l) => {
+          const opt = document.createElement("option");
+          opt.value = String(l.tsdb_league_id);
+          opt.textContent = l.name + " (TSDB " + l.tsdb_league_id + ")";
+          select.appendChild(opt);
+        });
+
+        // Auto-select URC if present
+        const defaultLeagueId = "4446";
+        const hasDefault =
+          Array.from(select.options).some((o) => o.value === defaultLeagueId);
+        if (hasDefault) {
+          select.value = defaultLeagueId;
+          loadTeamsForLeague(defaultLeagueId);
+        }
+      } catch (err) {
+        console.error(err);
+        placeholder.textContent = "Failed to load leagues";
+      }
+
+      select.addEventListener("change", (e) => {
+        const val = e.target.value;
+        if (!val) {
+          document.getElementById("team-a-options").innerHTML = "";
+          document.getElementById("team-b-options").innerHTML = "";
+          document.getElementById("team-a").value = "";
+          document.getElementById("team-b").value = "";
+          return;
+        }
+        loadTeamsForLeague(val);
+      });
+    }
+
+    // Form handler
+    document.getElementById("h2h-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      const leagueId = document.getElementById("league-select").value.trim();
+      const teamA = document.getElementById("team-a").value.trim();
+      const teamB = document.getElementById("team-b").value.trim();
+      const limit = document.getElementById("limit").value;
+
+      const errorEl = document.getElementById("error");
+      const btn = document.getElementById("submit-btn");
+      const resultsCard = document.getElementById("results-card");
+      const matchesBody = document.getElementById("matches-body");
+
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+      resultsCard.style.display = "none";
+      matchesBody.innerHTML = "";
+
+      if (!leagueId) {
+        errorEl.textContent = "Please select a league (or 'All leagues').";
+        errorEl.style.display = "block";
+        return;
+      }
+      if (!teamA || !teamB) {
+        errorEl.textContent = "Please enter both Team A and Team B.";
+        errorEl.style.display = "block";
+        return;
+      }
+
+      btn.disabled = true;
+
+      try {
+        const params = new URLSearchParams({
+          team_a: teamA,
+          team_b: teamB,
+          limit: String(limit),
+        });
+
+        const url =
+          "/headtohead/" +
+          encodeURIComponent(leagueId) +
+          "?" +
+          params.toString();
+        const data = await fetchJSON(url);
+
+        // Summary top section
+        document.getElementById("results-title").textContent =
+          "Head-to-head: " + data.team_a_name + " vs " + data.team_b_name;
+        document.getElementById("teams-label").textContent =
+          data.team_a_name + " vs " + data.team_b_name;
+        document.getElementById("league-label").textContent =
+          data.league_name +
+          " (TSDB " +
+          data.tsdb_league_id +
+          ")";
+
+        document.getElementById("overall-record").textContent =
+          data.team_a_wins + " – " + data.team_b_wins + " (W–L)";
+        document.getElementById("overall-extra").textContent =
+          data.draws +
+          " draw(s) across " +
+          data.total_matches +
+          " matches";
+
+        document.getElementById("win-rates").textContent =
+          percent(data.team_a_win_rate) +
+          " vs " +
+          percent(data.team_b_win_rate);
+        document.getElementById("win-rates-extra").textContent =
+          data.team_a_name + " vs " + data.team_b_name;
+
+        let streakText = "No streak data";
+        if (data.current_streak_type === "team_a_win") {
+          streakText =
+            data.team_a_name +
+            " – " +
+            data.current_streak_length +
+            " win(s) in a row";
+        } else if (data.current_streak_type === "team_b_win") {
+          streakText =
+            data.team_b_name +
+            " – " +
+            data.current_streak_length +
+            " win(s) in a row";
+        } else if (data.current_streak_type === "draw") {
+          streakText =
+            data.current_streak_length + " draw(s) in a row";
+        }
+        document.getElementById("streak").textContent = streakText;
+        document.getElementById("streak-extra").textContent =
+          "Based on most recent head-to-head matches";
+
+        document.getElementById("last-n-label").textContent =
+          "Showing up to " +
+          data.last_n.length +
+          " most recent matches between these teams.";
+
+        // Table of matches
+        for (const row of data.last_n) {
+          const tr = document.createElement("tr");
+
+          const tdDate = document.createElement("td");
+          tdDate.textContent = formatDate(row.kickoff_utc);
+          tr.appendChild(tdDate);
+
+          const tdSeason = document.createElement("td");
+          tdSeason.textContent = row.season_label || "-";
+          tr.appendChild(tdSeason);
+
+          const tdMatch = document.createElement("td");
+          tdMatch.textContent =
+            row.home_team_name + " vs " + row.away_team_name;
+          tr.appendChild(tdMatch);
+
+          const tdScore = document.createElement("td");
+          if (row.home_score == null || row.away_score == null) {
+            tdScore.textContent = "-";
+          } else {
+            tdScore.textContent =
+              row.home_score + " – " + row.away_score;
+          }
+          tr.appendChild(tdScore);
+
+          const tdResult = document.createElement("td");
+          const pill = document.createElement("span");
+          pill.className = resultPillClass(
+            row,
+            data.team_a_name,
+            data.team_b_name
+          );
+          pill.textContent = winnerLabel(
+            row,
+            data.team_a_name,
+            data.team_b_name
+          );
+          tdResult.appendChild(pill);
+          tr.appendChild(tdResult);
+
+          matchesBody.appendChild(tr);
+        }
+
+        resultsCard.style.display = "block";
+      } catch (err) {
+        console.error(err);
+        errorEl.textContent = err.message || "Something went wrong.";
+        errorEl.style.display = "block";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // Kick off initial load
+    loadLeagues();
+  </script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -123,32 +693,30 @@ class HeadToHeadResponse(BaseModel):
     last_n: List[MatchSummary]
 
 
+class LeagueInfo(BaseModel):
+    tsdb_league_id: int
+    name: str
+
+
+class TeamInfo(BaseModel):
+    team_id: int
+    name: str
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Rugby Analytics API",
-    version="0.2.0",
-    description="API exposing rugby standings and head-to-head stats.",
+    version="0.4.0",
+    description="API exposing rugby standings and head-to-head stats, plus a simple UI.",
 )
-
-# Serve a simple UI from / (index.html in ./static)
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "static"
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    index_path = STATIC_DIR / "index.html"
-    if not index_path.exists():
-        return HTMLResponse(
-            "<h1>Rugby Analytics</h1><p>Static UI not found yet. "
-            "Create static/index.html on the server.</p>",
-            status_code=200,
-        )
-    return index_path.read_text(encoding="utf-8")
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/health")
@@ -161,8 +729,6 @@ def health():
         conn.close()
         return {"status": "ok"}
     except Exception as e:
-        # In prod you probably wouldn't expose the error string,
-        # but it's useful while we're debugging.
         return {"status": "error", "detail": str(e)}
 
 
@@ -254,11 +820,124 @@ def _resolve_team_in_league(cur, league_id: int, name_query: str) -> dict:
             status_code=404,
             detail=f"No team found in league_id={league_id} matching '{name_query}'",
         )
-    if len(rows) > 1:
-        # For now we just pick the first; UI can be improved later
-        # to handle multiple matches.
-        pass
     return rows[0]
+
+
+def _resolve_team_global(cur, name_query: str) -> dict:
+    """
+    Find a team by fuzzy name across ALL leagues.
+    """
+    cur.execute(
+        """
+        SELECT t.team_id, t.name
+        FROM teams t
+        WHERE t.name ILIKE %s
+        ORDER BY t.name
+        """,
+        (f"%{name_query}%",),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No team found matching '{name_query}' in any league",
+        )
+    return rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Leagues & teams endpoints for the UI
+# ---------------------------------------------------------------------------
+
+@app.get("/leagues", response_model=List[LeagueInfo])
+def list_leagues():
+    """
+    List all leagues in the DB (tsdb_league_id + name).
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT tsdb_league_id, name
+            FROM leagues
+            ORDER BY name
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            LeagueInfo(tsdb_league_id=r["tsdb_league_id"], name=r["name"])
+            for r in rows
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/teams", response_model=List[TeamInfo])
+def list_teams(
+    tsdb_league_id: Optional[int] = Query(
+        None,
+        description="Optional TSDB league id to filter teams. Use 0 for 'all leagues'.",
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Optional name filter (ILIKE).",
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=500,
+        description="Max number of teams to return.",
+    ),
+):
+    """
+    List teams, optionally filtered by a TSDB league and/or name query.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        params = []
+        if tsdb_league_id is not None and tsdb_league_id != 0:
+            # Resolve to league_id
+            league = _resolve_league(cur, tsdb_league_id)
+            league_id = league["league_id"]
+
+            sql = """
+                SELECT DISTINCT t.team_id, t.name
+                FROM teams t
+                JOIN team_season_stats tss
+                  ON tss.team_id = t.team_id
+                WHERE tss.league_id = %s
+            """
+            params.append(league_id)
+
+            if q:
+                sql += " AND t.name ILIKE %s"
+                params.append(f"%{q}%")
+
+            sql += " ORDER BY t.name LIMIT %s"
+            params.append(limit)
+        else:
+            # All leagues
+            sql = """
+                SELECT DISTINCT t.team_id, t.name
+                FROM teams t
+                WHERE 1=1
+            """
+            if q:
+                sql += " AND t.name ILIKE %s"
+                params.append(f"%{q}%")
+            sql += " ORDER BY t.name LIMIT %s"
+            params.append(limit)
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        return [TeamInfo(team_id=r["team_id"], name=r["name"]) for r in rows]
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -286,19 +965,16 @@ def get_standings(
     conn = get_conn()
     cur = conn.cursor()
     try:
-        # 1) Resolve league_id from tsdb_league_id
         league = _resolve_league(cur, tsdb_league_id)
         league_id = league["league_id"]
         league_name = league["name"]
 
-        # 2) Resolve which season label we are using
         season_label_resolved = _resolve_season_label(
             cur,
             league_id=league_id,
             season_label=season_label if season_label else None,
         )
 
-        # 3) Load the standings rows from team_season_stats
         cur.execute(
             """
             SELECT
@@ -384,7 +1060,12 @@ def get_headtohead(
     limit: int = Query(10, ge=1, le=100, description="Number of recent matches to consider"),
 ):
     """
-    Head-to-head stats between two teams in a given league:
+    Head-to-head stats between two teams:
+
+    - If tsdb_league_id != 0: restrict to that league.
+    - If tsdb_league_id == 0: use ALL leagues in the DB.
+
+    Returns:
 
     - Last N matches (up to `limit`)
     - Total wins/draws
@@ -394,47 +1075,84 @@ def get_headtohead(
     conn = get_conn()
     cur = conn.cursor()
     try:
-        # Resolve league
-        league = _resolve_league(cur, tsdb_league_id)
-        league_id = league["league_id"]
-        league_name = league["name"]
+        if tsdb_league_id == 0:
+            league_name = "All leagues"
+            league_id = None
 
-        # Resolve teams (fuzzy match within this league)
-        team_a_row = _resolve_team_in_league(cur, league_id, team_a)
-        team_b_row = _resolve_team_in_league(cur, league_id, team_b)
+            team_a_row = _resolve_team_global(cur, team_a)
+            team_b_row = _resolve_team_global(cur, team_b)
 
-        team_a_id = team_a_row["team_id"]
-        team_a_name = team_a_row["name"]
-        team_b_id = team_b_row["team_id"]
-        team_b_name = team_b_row["name"]
+            team_a_id = team_a_row["team_id"]
+            team_a_name = team_a_row["name"]
+            team_b_id = team_b_row["team_id"]
+            team_b_name = team_b_row["name"]
 
-        # Load last N matches between these two teams in this league
-        cur.execute(
-            """
-            SELECT
-                m.match_id,
-                s.label AS season_label,
-                m.kickoff_utc,
-                ht.team_id AS home_team_id,
-                ht.name    AS home_team_name,
-                at.team_id AS away_team_id,
-                at.name    AS away_team_name,
-                m.home_score,
-                m.away_score
-            FROM matches m
-            JOIN seasons s ON s.season_id = m.season_id
-            JOIN teams ht ON ht.team_id = m.home_team_id
-            JOIN teams at ON at.team_id = m.away_team_id
-            WHERE m.league_id = %s
-              AND (
-                    (m.home_team_id = %s AND m.away_team_id = %s) OR
-                    (m.home_team_id = %s AND m.away_team_id = %s)
-                  )
-            ORDER BY m.kickoff_utc DESC
-            LIMIT %s
-            """,
-            (league_id, team_a_id, team_b_id, team_b_id, team_a_id, limit),
-        )
+            cur.execute(
+                """
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name,
+                    m.home_score,
+                    m.away_score
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE
+                    (
+                        (m.home_team_id = %s AND m.away_team_id = %s) OR
+                        (m.home_team_id = %s AND m.away_team_id = %s)
+                    )
+                ORDER BY m.kickoff_utc DESC
+                LIMIT %s
+                """,
+                (team_a_id, team_b_id, team_b_id, team_a_id, limit),
+            )
+        else:
+            league = _resolve_league(cur, tsdb_league_id)
+            league_id = league["league_id"]
+            league_name = league["name"]
+
+            team_a_row = _resolve_team_in_league(cur, league_id, team_a)
+            team_b_row = _resolve_team_in_league(cur, league_id, team_b)
+
+            team_a_id = team_a_row["team_id"]
+            team_a_name = team_a_row["name"]
+            team_b_id = team_b_row["team_id"]
+            team_b_name = team_b_row["name"]
+
+            cur.execute(
+                """
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name,
+                    m.home_score,
+                    m.away_score
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE m.league_id = %s
+                  AND (
+                        (m.home_team_id = %s AND m.away_team_id = %s) OR
+                        (m.home_team_id = %s AND m.away_team_id = %s)
+                      )
+                ORDER BY m.kickoff_utc DESC
+                LIMIT %s
+                """,
+                (league_id, team_a_id, team_b_id, team_b_id, team_a_id, limit),
+            )
+
         rows = cur.fetchall()
 
         if not rows:
@@ -446,14 +1164,12 @@ def get_headtohead(
                 ),
             )
 
-        # Compute stats
         total_matches = 0
         team_a_wins = 0
         team_b_wins = 0
         draws = 0
         match_summaries: List[MatchSummary] = []
 
-        # For current streak we process from most recent backward
         streak_type: Optional[str] = None  # "team_a_win", "team_b_win", "draw"
         streak_length = 0
 
@@ -473,7 +1189,6 @@ def get_headtohead(
                 else:
                     winner = "draw"
 
-                # Map to team_a / team_b result
                 if winner == "draw":
                     draws += 1
                     result_flag = "draw"
@@ -496,7 +1211,6 @@ def get_headtohead(
                             team_b_wins += 1
                             result_flag = "team_b_win"
 
-            # Build match summary
             kickoff = r["kickoff_utc"]
             if isinstance(kickoff, str):
                 try:
@@ -519,19 +1233,15 @@ def get_headtohead(
                 )
             )
 
-            # Update current streak (first rows are most recent)
             if idx == 0:
-                # Initialize streak with first result
                 streak_type = result_flag
                 streak_length = 1 if result_flag is not None else 0
             else:
                 if result_flag is not None and result_flag == streak_type:
                     streak_length += 1
                 else:
-                    # streak broken
                     break
 
-        # Compute win rates
         if total_matches > 0:
             team_a_win_rate = team_a_wins / total_matches
             team_b_win_rate = team_b_wins / total_matches
