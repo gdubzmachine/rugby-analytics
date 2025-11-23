@@ -243,7 +243,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <header>
     <h1>Rugby Analytics – Head-to-Head</h1>
-    <p>Compare two teams: last matches, win rates, and current streak.</p>
+    <p>Compare two teams: head-to-head, upcoming fixtures, and overall form.</p>
   </header>
   <main>
     <section class="card">
@@ -271,10 +271,10 @@ INDEX_HTML = """<!DOCTYPE html>
             <datalist id="team-b-options"></datalist>
           </div>
           <div>
-            <label for="limit">Last N matches</label>
+            <label for="limit">Last N matches (H2H & overall)</label>
             <select id="limit">
-              <option value="5">5</option>
-              <option value="10" selected>10</option>
+              <option value="5" selected>5</option>
+              <option value="10">10</option>
               <option value="20">20</option>
               <option value="50">50</option>
             </select>
@@ -294,23 +294,36 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="sub" id="league-label"></div>
         </div>
         <div class="summary-box">
-          <h3>Overall Record</h3>
+          <h3>H2H Record</h3>
           <div class="value" id="overall-record"></div>
           <div class="sub" id="overall-extra"></div>
         </div>
         <div class="summary-box">
-          <h3>Win Rates</h3>
+          <h3>H2H Win Rates</h3>
           <div class="value" id="win-rates"></div>
           <div class="sub" id="win-rates-extra"></div>
         </div>
         <div class="summary-box">
-          <h3>Current Streak</h3>
+          <h3>H2H Streak</h3>
           <div class="value" id="streak"></div>
           <div class="sub" id="streak-extra"></div>
         </div>
       </div>
 
-      <h3 style="margin-top:16px;">Last Matches</h3>
+      <div class="summary-grid" style="margin-top:16px;">
+        <div class="summary-box">
+          <h3 id="overall-a-title">Overall – Team A</h3>
+          <div class="value" id="overall-a-record"></div>
+          <div class="sub" id="overall-a-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3 id="overall-b-title">Overall – Team B</h3>
+          <div class="value" id="overall-b-record"></div>
+          <div class="sub" id="overall-b-extra"></div>
+        </div>
+      </div>
+
+      <h3 style="margin-top:16px;">Last Head-to-Head Matches</h3>
       <div class="small" id="last-n-label"></div>
       <div style="max-height:320px; overflow-y:auto; margin-top:4px;">
         <table>
@@ -557,14 +570,14 @@ INDEX_HTML = """<!DOCTYPE html>
           data.draws +
           " draw(s) across " +
           data.total_matches +
-          " played matches";
+          " played head-to-head matches";
 
         document.getElementById("win-rates").textContent =
           percent(data.team_a_win_rate) +
           " vs " +
           percent(data.team_b_win_rate);
         document.getElementById("win-rates-extra").textContent =
-          data.team_a_name + " vs " + data.team_b_name;
+          data.team_a_name + " vs " + data.team_b_name + " (H2H only)";
 
         let streakText = "No streak data";
         if (data.current_streak_type === "team_a_win") {
@@ -572,25 +585,53 @@ INDEX_HTML = """<!DOCTYPE html>
             data.team_a_name +
             " – " +
             data.current_streak_length +
-            " win(s) in a row";
+            " H2H win(s) in a row";
         } else if (data.current_streak_type === "team_b_win") {
           streakText =
             data.team_b_name +
             " – " +
             data.current_streak_length +
-            " win(s) in a row";
+            " H2H win(s) in a row";
         } else if (data.current_streak_type === "draw") {
           streakText =
-            data.current_streak_length + " draw(s) in a row";
+            data.current_streak_length + " H2H draw(s) in a row";
         }
         document.getElementById("streak").textContent = streakText;
         document.getElementById("streak-extra").textContent =
           "Based on most recent played head-to-head matches";
 
+        // Overall summaries
+        const oa = data.team_a_overall;
+        const ob = data.team_b_overall;
+
+        document.getElementById("overall-a-title").textContent =
+          "Overall – " + oa.team_name;
+        document.getElementById("overall-b-title").textContent =
+          "Overall – " + ob.team_name;
+
+        document.getElementById("overall-a-record").textContent =
+          oa.wins + "-" + oa.draws + "-" + oa.losses +
+          " (W-D-L)";
+        document.getElementById("overall-b-record").textContent =
+          ob.wins + "-" + ob.draws + "-" + ob.losses +
+          " (W-D-L)";
+
+        document.getElementById("overall-a-extra").textContent =
+          "Last " + oa.total_played + " played: " +
+          percent(oa.win_rate) +
+          " win rate, win streak " +
+          oa.current_win_streak;
+        document.getElementById("overall-b-extra").textContent =
+          "Last " + ob.total_played + " played: " +
+          percent(ob.win_rate) +
+          " win rate, win streak " +
+          ob.current_win_streak;
+
+        // H2H last N table
         document.getElementById("last-n-label").textContent =
           "Showing up to " +
           data.last_n.length +
-          " most recent played matches between these teams.";
+          " most recent played head-to-head matches between these teams.";
 
         for (const row of data.last_n) {
           const tr = document.createElement("tr");
@@ -635,12 +676,13 @@ INDEX_HTML = """<!DOCTYPE html>
           matchesBody.appendChild(tr);
         }
 
+        // Upcoming fixtures
         if (data.upcoming && data.upcoming.length > 0) {
           upcomingTitle.style.display = "block";
           upcomingLabel.style.display = "block";
           upcomingContainer.style.display = "block";
           upcomingLabel.textContent =
-            "Upcoming fixtures between these teams (not included in streak/win rates).";
+            "Upcoming fixtures between these teams (not included in H2H or overall streak/win rates).";
 
           for (const row of data.upcoming) {
             const tr = document.createElement("tr");
@@ -730,6 +772,18 @@ class FixtureSummary(BaseModel):
     away_team_name: str
 
 
+class TeamOverallSummary(BaseModel):
+    team_id: int
+    team_name: str
+    total_played: int
+    wins: int
+    draws: int
+    losses: int
+    win_rate: float
+    current_win_streak: int
+    last_n_overall: List[MatchSummary]
+
+
 class HeadToHeadResponse(BaseModel):
     tsdb_league_id: int
     league_name: str
@@ -737,7 +791,7 @@ class HeadToHeadResponse(BaseModel):
     team_a_name: str
     team_b_id: int
     team_b_name: str
-    total_matches: int  # number of PLAYED matches
+    total_matches: int  # number of PLAYED H2H matches
     team_a_wins: int
     team_b_wins: int
     draws: int
@@ -745,8 +799,10 @@ class HeadToHeadResponse(BaseModel):
     team_b_win_rate: float
     current_streak_type: Optional[str]
     current_streak_length: int
-    last_n: List[MatchSummary]          # last N played matches
+    last_n: List[MatchSummary]          # last N played H2H matches
     upcoming: List[FixtureSummary]      # future fixtures (not in streak/win rate)
+    team_a_overall: TeamOverallSummary  # overall form across all leagues
+    team_b_overall: TeamOverallSummary  # overall form across all leagues
 
 
 class LeagueInfo(BaseModel):
@@ -765,7 +821,7 @@ class TeamInfo(BaseModel):
 
 app = FastAPI(
     title="Rugby Analytics API",
-    version="0.5.0",
+    version="0.6.0",
     description="API exposing rugby standings and head-to-head stats, plus a simple UI.",
 )
 
@@ -898,6 +954,125 @@ def _resolve_team_global(cur, name_query: str) -> dict:
             detail=f"No team found matching '{name_query}' in any league",
         )
     return rows[0]
+
+
+def _compute_overall_for_team(cur, team_id: int, team_name: str, limit: int) -> TeamOverallSummary:
+    """
+    Compute overall form for a team across ALL leagues:
+
+    - last `limit` played matches (scores not null)
+    - wins/draws/losses over that sample
+    - win_rate = wins / total_played
+    - current_win_streak = consecutive wins from most recent match backwards
+    """
+    cur.execute(
+        """
+        SELECT
+            m.match_id,
+            s.label AS season_label,
+            m.kickoff_utc,
+            ht.team_id AS home_team_id,
+            ht.name    AS home_team_name,
+            at.team_id AS away_team_id,
+            at.name    AS away_team_name,
+            m.home_score,
+            m.away_score
+        FROM matches m
+        JOIN seasons s ON s.season_id = m.season_id
+        JOIN teams ht ON ht.team_id = m.home_team_id
+        JOIN teams at ON at.team_id = m.away_team_id
+        WHERE (m.home_team_id = %s OR m.away_team_id = %s)
+          AND m.home_score IS NOT NULL
+          AND m.away_score IS NOT NULL
+        ORDER BY m.kickoff_utc DESC
+        LIMIT %s
+        """,
+        (team_id, team_id, limit),
+    )
+    rows = cur.fetchall()
+
+    last_matches: List[MatchSummary] = []
+    wins = draws = losses = 0
+    results: List[str] = []  # "win"/"draw"/"loss" from perspective of this team
+
+    for r in rows:
+        hs = r["home_score"]
+        as_ = r["away_score"]
+        home_is_team = (r["home_team_id"] == team_id)
+
+        if hs > as_:
+            if home_is_team:
+                result = "win"
+            else:
+                result = "loss"
+        elif as_ > hs:
+            if not home_is_team:
+                result = "win"
+            else:
+                result = "loss"
+        else:
+            result = "draw"
+
+        if result == "win":
+            wins += 1
+        elif result == "draw":
+            draws += 1
+        else:
+            losses += 1
+
+        results.append(result)
+
+        kickoff = r["kickoff_utc"]
+        if isinstance(kickoff, str):
+            try:
+                kickoff = datetime.fromisoformat(kickoff)
+            except Exception:
+                kickoff = None
+
+        # winner field kept as "home"/"away"/"draw" for consistency
+        if hs > as_:
+            winner = "home"
+        elif as_ > hs:
+            winner = "away"
+        else:
+            winner = "draw"
+
+        last_matches.append(
+            MatchSummary(
+                match_id=r["match_id"],
+                season_label=r["season_label"],
+                kickoff_utc=kickoff,
+                home_team_id=r["home_team_id"],
+                home_team_name=r["home_team_name"],
+                away_team_id=r["away_team_id"],
+                away_team_name=r["away_team_name"],
+                home_score=hs,
+                away_score=as_,
+                winner=winner,
+            )
+        )
+
+    total_played = len(rows)
+    win_rate = (wins / total_played) if total_played > 0 else 0.0
+
+    streak = 0
+    for res in results:
+        if res == "win":
+            streak += 1
+        else:
+            break
+
+    return TeamOverallSummary(
+        team_id=team_id,
+        team_name=team_name,
+        total_played=total_played,
+        wins=wins,
+        draws=draws,
+        losses=losses,
+        win_rate=win_rate,
+        current_win_streak=streak,
+        last_n_overall=last_matches,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1110,19 +1285,27 @@ def get_headtohead(
     tsdb_league_id: int,
     team_a: str = Query(..., description="Name (or part) of Team A"),
     team_b: str = Query(..., description="Name (or part) of Team B"),
-    limit: int = Query(10, ge=1, le=100, description="Number of recent matches to consider"),
+    limit: int = Query(
+        10,
+        ge=1,
+        le=100,
+        description="Number of recent matches to consider (H2H and overall).",
+    ),
 ):
     """
     Head-to-head stats between two teams:
 
-    - If tsdb_league_id != 0: restrict to that league.
+    - If tsdb_league_id != 0: restrict H2H to that league.
     - If tsdb_league_id == 0: use ALL leagues in the DB.
 
-    Stats (wins, win rates, streak) are based ONLY on played matches
+    H2H stats (wins, win rates, streak) are based ONLY on played matches
     where home_score AND away_score are NOT NULL.
 
     Upcoming fixtures (missing scores, kickoff in the future) are returned
     in a separate 'upcoming' list and DO NOT affect percentages or streaks.
+
+    Overall form for each team (team_a_overall / team_b_overall) is based on
+    their last `limit` played matches across ALL leagues.
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -1258,7 +1441,7 @@ def get_headtohead(
             """
             params_upcoming = base_params + (now_utc,)
 
-        # Played matches
+        # Played H2H matches
         cur.execute(sql_played, params_played)
         played_rows = cur.fetchall()
 
@@ -1266,6 +1449,8 @@ def get_headtohead(
         cur.execute(sql_upcoming, params_upcoming)
         upcoming_rows = cur.fetchall()
 
+        # It is okay if there are only upcoming fixtures (no played yet),
+        # but then H2H stats will all be zero.
         if not played_rows and not upcoming_rows:
             raise HTTPException(
                 status_code=404,
@@ -1360,6 +1545,7 @@ def get_headtohead(
             team_a_win_rate = 0.0
             team_b_win_rate = 0.0
 
+        # Upcoming fixtures (H2H)
         upcoming_list: List[FixtureSummary] = []
         for r in upcoming_rows:
             kickoff = r["kickoff_utc"]
@@ -1381,6 +1567,10 @@ def get_headtohead(
                 )
             )
 
+        # Overall form for each team (across ALL leagues)
+        team_a_overall = _compute_overall_for_team(cur, team_a_id, team_a_name, limit)
+        team_b_overall = _compute_overall_for_team(cur, team_b_id, team_b_name, limit)
+
         return HeadToHeadResponse(
             tsdb_league_id=tsdb_league_id,
             league_name=league_name,
@@ -1398,6 +1588,8 @@ def get_headtohead(
             current_streak_length=streak_length,
             last_n=match_summaries,
             upcoming=upcoming_list,
+            team_a_overall=team_a_overall,
+            team_b_overall=team_b_overall,
         )
 
     finally:
