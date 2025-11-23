@@ -1,491 +1,1405 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+api/main.py
+-----------
+
+FastAPI app for rugby analytics:
+
+- /health
+- /leagues
+- /teams
+- /standings/{tsdb_league_id}
+- /headtohead/{tsdb_league_id}
+- /         (simple built-in UI for head-to-head)
+
+It expects the following tables:
+
+- sports
+- leagues (with tsdb_league_id)
+- seasons  (with league_id, year, label)
+- teams
+- matches
+- team_season_stats
+
+It uses DATABASE_URL from the environment (.env locally, Render env vars in prod),
+falling back to a hard-coded Render URL for now.
+"""
+
 import os
-from datetime import date
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
+
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-
 # ---------------------------------------------------------------------------
-# Config
+# Environment / DB helpers
 # ---------------------------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+load_dotenv()  # locally; no-op on Render
 
-if not DATABASE_URL:
-    # We don't crash import, but endpoints will raise a 500 with a clear message
-    print("WARNING: DATABASE_URL is not set. API endpoints that hit the DB will fail.")
-
-app = FastAPI(title="Rugby Analytics API", version="0.2.0")
-
-# Allow frontends (localhost dev + Render site) – adjust as needed
-origins = [
-    "http://localhost",
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "*",  # you can tighten this later
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Fallback DB URL for Render if DATABASE_URL env var is missing.
+DEFAULT_DB_URL = (
+    "postgresql://rugby_analytics_user:"
+    "a5tDWnLOBdGEqSQGEcEjfiXaSbIlFksT"
+    "@dpg-d4grdqili9vc73dqbtf0-a.oregon-postgres.render.com"
+    "/rugby_analytics"
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+
 
 def get_conn():
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not set")
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB connection failed: {e}")
-
-
-# Groups of teams that should be treated as the *same* franchise
-# Keyed by lower-case name for easy matching.
-TEAM_ALIAS_MAP: Dict[str, List[str]] = {
-    # Stormers franchise
-    "stormers": ["Stormers", "Western Province"],
-    "western province": ["Stormers", "Western Province"],
-    # Bulls franchise
-    "bulls": ["Bulls", "Blue Bulls"],
-    "blue bulls": ["Bulls", "Blue Bulls"],
-    # Add more mappings here as needed
-}
-
-
-def _get_team_group_ids_and_label(cur, team_id: int) -> Dict[str, Any]:
     """
-    Given a concrete team_id, return:
-      - all team_ids that belong to the same franchise group (alias group)
-      - a nice display label like 'Stormers (Western Province)'.
-
-    If there is no alias mapping, this just returns the single team_id and name.
+    Always try to connect using DATABASE_URL if set,
+    otherwise fall back to DEFAULT_DB_URL.
     """
-    cur.execute("SELECT team_id, name FROM teams WHERE team_id = %s", (team_id,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Team with id={team_id} not found")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-    base_id = row["team_id"]
-    base_name = row["name"]
-    base_key = base_name.lower()
 
-    alias_names = TEAM_ALIAS_MAP.get(base_key, [base_name])
+# ---------------------------------------------------------------------------
+# Built-in UI HTML at "/"
+# ---------------------------------------------------------------------------
 
-    # Fetch all matching teams by name (case-insensitive)
-    lower_aliases = [n.lower() for n in alias_names]
-    cur.execute(
-        """
-        SELECT team_id, name
-        FROM teams
-        WHERE lower(name) = ANY(%s)
-        ORDER BY name
-        """,
-        (lower_aliases,),
-    )
-    rows = cur.fetchall()
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Rugby Analytics – Head to Head</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #0b1020;
+      color: #f5f5f5;
+    }
+    header {
+      padding: 16px 24px;
+      background: #111827;
+      border-bottom: 1px solid #1f2933;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.4rem;
+    }
+    header p {
+      margin: 4px 0 0;
+      font-size: 0.9rem;
+      color: #9ca3af;
+    }
+    main {
+      max-width: 1100px;
+      margin: 24px auto 40px;
+      padding: 0 16px;
+    }
+    .card {
+      background: #111827;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      border: 1px solid #1f2937;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 1.1rem;
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      margin-bottom: 4px;
+      color: #d1d5db;
+    }
+    input, select, button {
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    input, select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #f9fafb;
+      outline: none;
+    }
+    input:focus, select:focus {
+      border-color: #3b82f6;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    button {
+      margin-top: 8px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: none;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    button:disabled {
+      background: #374151;
+      cursor: wait;
+    }
+    .error {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      color: #fecaca;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 8px;
+    }
+    .summary-box {
+      background: #020617;
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid #1f2937;
+    }
+    .summary-box h3 {
+      margin: 0 0 4px;
+      font-size: 0.9rem;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .summary-box .value {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .summary-box .sub {
+      font-size: 0.85rem;
+      color: #9ca3af;
+      margin-top: 2px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #1f2933;
+      text-align: left;
+    }
+    th {
+      font-weight: 500;
+      color: #9ca3af;
+      background: #020617;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tr:nth-child(even) td {
+      background: #020617;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+    }
+    .pill-win {
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+    }
+    .pill-loss {
+      background: rgba(248, 113, 113, 0.15);
+      color: #fca5a5;
+    }
+    .pill-draw {
+      background: rgba(251, 191, 36, 0.15);
+      color: #facc15;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rugby Analytics – Head-to-Head</h1>
+    <p>Compare two teams: last matches, win rates, and current streak.</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Compare Teams</h2>
+      <form id="h2h-form">
+        <div class="form-row">
+          <div>
+            <label for="league-select">League</label>
+            <select id="league-select">
+              <option value="">Loading leagues…</option>
+            </select>
+            <div class="small">
+              Leagues are loaded from your rugby_analytics DB.
+              Choose “All leagues” to combine all competitions.
+            </div>
+          </div>
+          <div>
+            <label for="team-a">Team A</label>
+            <input id="team-a" type="text" placeholder="e.g. Bulls" list="team-a-options" />
+            <datalist id="team-a-options"></datalist>
+          </div>
+          <div>
+            <label for="team-b">Team B</label>
+            <input id="team-b" type="text" placeholder="e.g. Leinster" list="team-b-options" />
+            <datalist id="team-b-options"></datalist>
+          </div>
+          <div>
+            <label for="limit">Last N matches</label>
+            <select id="limit">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" id="submit-btn">Compare</button>
+        <div id="error" class="error" style="display:none;"></div>
+      </form>
+    </section>
 
-    if not rows:
-        # Shouldn't happen, but fallback to just the base team
-        return {
-            "team_ids": [base_id],
-            "display_name": base_name,
-            "canonical_name": base_name,
-        }
+    <section class="card" id="results-card" style="display:none;">
+      <h2 id="results-title">Head-to-Head Results</h2>
+      <div class="summary-grid">
+        <div class="summary-box">
+          <h3>Teams</h3>
+          <div class="value" id="teams-label"></div>
+          <div class="sub" id="league-label"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Overall Record</h3>
+          <div class="value" id="overall-record"></div>
+          <div class="sub" id="overall-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Win Rates</h3>
+          <div class="value" id="win-rates"></div>
+          <div class="sub" id="win-rates-extra"></div>
+        </div>
+        <div class="summary-box">
+          <h3>Current Streak</h3>
+          <div class="value" id="streak"></div>
+          <div class="sub" id="streak-extra"></div>
+        </div>
+      </div>
 
-    team_ids = [r["team_id"] for r in rows]
-    names = [r["name"] for r in rows]
+      <h3 style="margin-top:16px;">Last Matches</h3>
+      <div class="small" id="last-n-label"></div>
+      <div style="max-height:320px; overflow-y:auto; margin-top:4px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Season</th>
+              <th>Match</th>
+              <th>Score</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="matches-body"></tbody>
+        </table>
+      </div>
 
-    # Canonical name = base name
-    canonical = base_name
-    # Display label: "Stormers (Western Province)" if >1 distinct name
-    unique_names = sorted(set(names))
-    if len(unique_names) == 1:
-        display = unique_names[0]
-    else:
-        primary = base_name
-        others = [n for n in unique_names if n != primary]
-        if not others:
-            # if base_name not in unique_names for some reason, just take first as primary
-            primary = unique_names[0]
-            others = unique_names[1:]
-        display = f"{primary} ({', '.join(others)})"
+      <h3 style="margin-top:16px; display:none;" id="upcoming-title">Upcoming Fixtures</h3>
+      <div class="small" id="upcoming-label" style="display:none;"></div>
+      <div style="max-height:320px; overflow-y:auto; margin-top:4px; display:none;" id="upcoming-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Season</th>
+              <th>Match</th>
+            </tr>
+          </thead>
+          <tbody id="upcoming-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
 
-    return {
-        "team_ids": team_ids,
-        "display_name": display,
-        "canonical_name": canonical,
+  <script>
+    function formatDate(iso) {
+      if (!iso) return "-";
+      try {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return "-";
+        return d.toISOString().slice(0, 10);
+      } catch {
+        return "-";
+      }
     }
 
+    function percent(n) {
+      return (n * 100).toFixed(1) + "%";
+    }
 
-def _load_latest_season_label(cur, tsdb_league_id: int) -> str:
+    function winnerLabel(row, teamAName, teamBName) {
+      if (row.home_score == null || row.away_score == null) return "No score";
+
+      if (row.home_score > row.away_score) {
+        if (row.home_team_name === teamAName) return teamAName + " win";
+        if (row.home_team_name === teamBName) return teamBName + " win";
+        return row.home_team_name + " win";
+      } else if (row.away_score > row.home_score) {
+        if (row.away_team_name === teamAName) return teamAName + " win";
+        if (row.away_team_name === teamBName) return teamBName + " win";
+        return row.away_team_name + " win";
+      } else {
+        return "Draw";
+      }
+    }
+
+    function resultPillClass(row, teamAName, teamBName) {
+      if (row.home_score == null || row.away_score == null) return "";
+      if (row.home_score === row.away_score) return "pill pill-draw";
+
+      const label = winnerLabel(row, teamAName, teamBName);
+      if (label.startsWith(teamAName)) return "pill pill-win";
+      if (label.startsWith(teamBName)) return "pill pill-loss";
+      return "pill";
+    }
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let msg = "Request failed: " + res.status;
+        try {
+          const data = await res.json();
+          if (data.detail) msg = data.detail;
+        } catch {}
+        throw new Error(msg);
+      }
+      return res.json();
+    }
+
+    function populateTeamsOptions(teams) {
+      const listA = document.getElementById("team-a-options");
+      const listB = document.getElementById("team-b-options");
+      listA.innerHTML = "";
+      listB.innerHTML = "";
+
+      teams.forEach((t) => {
+        const optA = document.createElement("option");
+        optA.value = t.name;
+        listA.appendChild(optA);
+
+        const optB = document.createElement("option");
+        optB.value = t.name;
+        listB.appendChild(optB);
+      });
+    }
+
+    async function loadTeamsForLeague(leagueId) {
+      const listA = document.getElementById("team-a-options");
+      const listB = document.getElementById("team-b-options");
+      listA.innerHTML = "";
+      listB.innerHTML = "";
+      document.getElementById("team-a").value = "";
+      document.getElementById("team-b").value = "";
+
+      if (!leagueId && leagueId !== 0 && leagueId !== "0") {
+        return;
+      }
+
+      try {
+        const url =
+          "/teams?limit=200" +
+          "&tsdb_league_id=" +
+          encodeURIComponent(leagueId);
+        const teams = await fetchJSON(url);
+        populateTeamsOptions(teams);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function loadLeagues() {
+      const select = document.getElementById("league-select");
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "Select league…";
+      select.appendChild(placeholder);
+
+      const allOption = document.createElement("option");
+      allOption.value = "0";
+      allOption.textContent = "All leagues";
+      select.appendChild(allOption);
+
+      try {
+        const leagues = await fetchJSON("/leagues");
+
+        leagues.forEach((l) => {
+          const opt = document.createElement("option");
+          opt.value = String(l.tsdb_league_id);
+          opt.textContent = l.name + " (TSDB " + l.tsdb_league_id + ")";
+          select.appendChild(opt);
+        });
+
+        const defaultLeagueId = "4446";
+        const hasDefault =
+          Array.from(select.options).some((o) => o.value === defaultLeagueId);
+        if (hasDefault) {
+          select.value = defaultLeagueId;
+          loadTeamsForLeague(defaultLeagueId);
+        }
+      } catch (err) {
+        console.error(err);
+        placeholder.textContent = "Failed to load leagues";
+      }
+
+      select.addEventListener("change", (e) => {
+        const val = e.target.value;
+        if (!val) {
+          document.getElementById("team-a-options").innerHTML = "";
+          document.getElementById("team-b-options").innerHTML = "";
+          document.getElementById("team-a").value = "";
+          document.getElementById("team-b").value = "";
+          return;
+        }
+        loadTeamsForLeague(val);
+      });
+    }
+
+    document.getElementById("h2h-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      const leagueId = document.getElementById("league-select").value.trim();
+      const teamA = document.getElementById("team-a").value.trim();
+      const teamB = document.getElementById("team-b").value.trim();
+      const limit = document.getElementById("limit").value;
+
+      const errorEl = document.getElementById("error");
+      const btn = document.getElementById("submit-btn");
+      const resultsCard = document.getElementById("results-card");
+      const matchesBody = document.getElementById("matches-body");
+      const upcomingTitle = document.getElementById("upcoming-title");
+      const upcomingLabel = document.getElementById("upcoming-label");
+      const upcomingContainer = document.getElementById("upcoming-container");
+      const upcomingBody = document.getElementById("upcoming-body");
+
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+      resultsCard.style.display = "none";
+      matchesBody.innerHTML = "";
+      upcomingBody.innerHTML = "";
+      upcomingTitle.style.display = "none";
+      upcomingLabel.style.display = "none";
+      upcomingContainer.style.display = "none";
+
+      if (!leagueId) {
+        errorEl.textContent = "Please select a league (or 'All leagues').";
+        errorEl.style.display = "block";
+        return;
+      }
+      if (!teamA || !teamB) {
+        errorEl.textContent = "Please enter both Team A and Team B.";
+        errorEl.style.display = "block";
+        return;
+      }
+
+      btn.disabled = true;
+
+      try {
+        const params = new URLSearchParams({
+          team_a: teamA,
+          team_b: teamB,
+          limit: String(limit),
+        });
+
+        const url =
+          "/headtohead/" +
+          encodeURIComponent(leagueId) +
+          "?" +
+          params.toString();
+        const data = await fetchJSON(url);
+
+        document.getElementById("results-title").textContent =
+          "Head-to-head: " + data.team_a_name + " vs " + data.team_b_name;
+        document.getElementById("teams-label").textContent =
+          data.team_a_name + " vs " + data.team_b_name;
+        document.getElementById("league-label").textContent =
+          data.league_name +
+          " (TSDB " +
+          data.tsdb_league_id +
+          ")";
+
+        document.getElementById("overall-record").textContent =
+          data.team_a_wins + " – " + data.team_b_wins + " (W–L)";
+        document.getElementById("overall-extra").textContent =
+          data.draws +
+          " draw(s) across " +
+          data.total_matches +
+          " played matches";
+
+        document.getElementById("win-rates").textContent =
+          percent(data.team_a_win_rate) +
+          " vs " +
+          percent(data.team_b_win_rate);
+        document.getElementById("win-rates-extra").textContent =
+          data.team_a_name + " vs " + data.team_b_name;
+
+        let streakText = "No streak data";
+        if (data.current_streak_type === "team_a_win") {
+          streakText =
+            data.team_a_name +
+            " – " +
+            data.current_streak_length +
+            " win(s) in a row";
+        } else if (data.current_streak_type === "team_b_win") {
+          streakText =
+            data.team_b_name +
+            " – " +
+            data.current_streak_length +
+            " win(s) in a row";
+        } else if (data.current_streak_type === "draw") {
+          streakText =
+            data.current_streak_length + " draw(s) in a row";
+        }
+        document.getElementById("streak").textContent = streakText;
+        document.getElementById("streak-extra").textContent =
+          "Based on most recent played head-to-head matches";
+
+        document.getElementById("last-n-label").textContent =
+          "Showing up to " +
+          data.last_n.length +
+          " most recent played matches between these teams.";
+
+        for (const row of data.last_n) {
+          const tr = document.createElement("tr");
+
+          const tdDate = document.createElement("td");
+          tdDate.textContent = formatDate(row.kickoff_utc);
+          tr.appendChild(tdDate);
+
+          const tdSeason = document.createElement("td");
+          tdSeason.textContent = row.season_label || "-";
+          tr.appendChild(tdSeason);
+
+          const tdMatch = document.createElement("td");
+          tdMatch.textContent =
+            row.home_team_name + " vs " + row.away_team_name;
+          tr.appendChild(tdMatch);
+
+          const tdScore = document.createElement("td");
+          if (row.home_score == null || row.away_score == null) {
+            tdScore.textContent = "-";
+          } else {
+            tdScore.textContent =
+              row.home_score + " – " + row.away_score;
+          }
+          tr.appendChild(tdScore);
+
+          const tdResult = document.createElement("td");
+          const pill = document.createElement("span");
+          pill.className = resultPillClass(
+            row,
+            data.team_a_name,
+            data.team_b_name
+          );
+          pill.textContent = winnerLabel(
+            row,
+            data.team_a_name,
+            data.team_b_name
+          );
+          tdResult.appendChild(pill);
+          tr.appendChild(tdResult);
+
+          matchesBody.appendChild(tr);
+        }
+
+        if (data.upcoming && data.upcoming.length > 0) {
+          upcomingTitle.style.display = "block";
+          upcomingLabel.style.display = "block";
+          upcomingContainer.style.display = "block";
+          upcomingLabel.textContent =
+            "Upcoming fixtures between these teams (not included in streak/win rates).";
+
+          for (const row of data.upcoming) {
+            const tr = document.createElement("tr");
+
+            const tdDate = document.createElement("td");
+            tdDate.textContent = formatDate(row.kickoff_utc);
+            tr.appendChild(tdDate);
+
+            const tdSeason = document.createElement("td");
+            tdSeason.textContent = row.season_label || "-";
+            tr.appendChild(tdSeason);
+
+            const tdMatch = document.createElement("td");
+            tdMatch.textContent =
+              row.home_team_name + " vs " + row.away_team_name;
+            tr.appendChild(tdMatch);
+
+            upcomingBody.appendChild(tr);
+          }
+        }
+
+        resultsCard.style.display = "block";
+      } catch (err) {
+        console.error(err);
+        errorEl.textContent = err.message || "Something went wrong.";
+        errorEl.style.display = "block";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    loadLeagues();
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class StandingRow(BaseModel):
+    position: int
+    team_id: int
+    team_name: str
+    season_label: str
+    games_played: int
+    wins: int
+    draws: int
+    losses: int
+    points_for: int
+    points_against: int
+    points_diff: int
+    competition_points: int
+    losing_bonus_points: int
+    try_bonus_points: int
+
+
+class StandingsResponse(BaseModel):
+    tsdb_league_id: int
+    league_name: str
+    season_label: str
+    rows: List[StandingRow]
+
+
+class MatchSummary(BaseModel):
+    match_id: int
+    season_label: str
+    kickoff_utc: Optional[datetime]
+    home_team_id: int
+    home_team_name: str
+    away_team_id: int
+    away_team_name: str
+    home_score: Optional[int]
+    away_score: Optional[int]
+    winner: Optional[str]
+
+
+class FixtureSummary(BaseModel):
+    match_id: int
+    season_label: str
+    kickoff_utc: Optional[datetime]
+    home_team_id: int
+    home_team_name: str
+    away_team_id: int
+    away_team_name: str
+
+
+class HeadToHeadResponse(BaseModel):
+    tsdb_league_id: int
+    league_name: str
+    team_a_id: int
+    team_a_name: str
+    team_b_id: int
+    team_b_name: str
+    total_matches: int  # number of PLAYED matches
+    team_a_wins: int
+    team_b_wins: int
+    draws: int
+    team_a_win_rate: float
+    team_b_win_rate: float
+    current_streak_type: Optional[str]
+    current_streak_length: int
+    last_n: List[MatchSummary]          # last N played matches
+    upcoming: List[FixtureSummary]      # future fixtures (not in streak/win rate)
+
+
+class LeagueInfo(BaseModel):
+    tsdb_league_id: int
+    name: str
+
+
+class TeamInfo(BaseModel):
+    team_id: int
+    name: str
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Rugby Analytics API",
+    version="0.5.0",
+    description="API exposing rugby standings and head-to-head stats, plus a simple UI.",
+)
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/health")
+def health():
+    """
+    Simple health check. Also verifies DB connectivity.
+    """
+    try:
+        conn = get_conn()
+        conn.close()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _resolve_league(cur, tsdb_league_id: int) -> dict:
     cur.execute(
         """
-        SELECT s.label
-        FROM team_season_stats tss
-        JOIN seasons s ON s.season_id = tss.season_id
-        JOIN leagues l ON l.league_id = tss.league_id
-        WHERE l.tsdb_league_id = %s
-        ORDER BY s.year DESC
-        LIMIT 1
+        SELECT league_id, tsdb_league_id, name
+        FROM leagues
+        WHERE tsdb_league_id = %s
         """,
         (tsdb_league_id,),
     )
     row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="No seasons found for this league")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No league found with tsdb_league_id={tsdb_league_id}",
+        )
+    return row
+
+
+def _resolve_season_label(cur, league_id: int, season_label: Optional[str]) -> str:
+    """
+    If season_label is provided, validate it exists for this league.
+    If it is None, pick the latest season by year.
+    """
+    if season_label:
+        cur.execute(
+            """
+            SELECT label
+            FROM seasons
+            WHERE league_id = %s
+              AND label = %s
+            """,
+            (league_id, season_label),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Season '{season_label}' not found for league_id={league_id}",
+            )
+        return row["label"]
+
+    cur.execute(
+        """
+        SELECT label
+        FROM seasons
+        WHERE league_id = %s
+        ORDER BY year DESC
+        LIMIT 1
+        """,
+        (league_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No seasons found for league_id={league_id}",
+        )
     return row["label"]
 
 
+def _resolve_team_in_league(cur, league_id: int, name_query: str) -> dict:
+    """
+    Find a team in this league by fuzzy name match.
+    We restrict to teams that appear in team_season_stats for this league.
+    """
+    cur.execute(
+        """
+        SELECT DISTINCT t.team_id, t.name
+        FROM teams t
+        JOIN team_season_stats tss
+          ON tss.team_id = t.team_id
+        WHERE tss.league_id = %s
+          AND t.name ILIKE %s
+        ORDER BY t.name
+        """,
+        (league_id, f"%{name_query}%"),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No team found in league_id={league_id} matching '{name_query}'",
+        )
+    return rows[0]
+
+
+def _resolve_team_global(cur, name_query: str) -> dict:
+    """
+    Find a team by fuzzy name across ALL leagues.
+    """
+    cur.execute(
+        """
+        SELECT t.team_id, t.name
+        FROM teams t
+        WHERE t.name ILIKE %s
+        ORDER BY t.name
+        """,
+        (f"%{name_query}%",),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No team found matching '{name_query}' in any league",
+        )
+    return rows[0]
+
+
 # ---------------------------------------------------------------------------
-# Endpoints
+# Leagues & teams endpoints for the UI
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/leagues")
+@app.get("/leagues", response_model=List[LeagueInfo])
 def list_leagues():
+    """
+    List all leagues in the DB (tsdb_league_id + name).
+    """
     conn = get_conn()
+    cur = conn.cursor()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT league_id, tsdb_league_id, name, short_name, slug, country_code, "group"
-                FROM leagues
-                ORDER BY name
-                """
-            )
-            rows = cur.fetchall()
-            return {"leagues": rows}
+        cur.execute(
+            """
+            SELECT tsdb_league_id, name
+            FROM leagues
+            ORDER BY name
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            LeagueInfo(tsdb_league_id=r["tsdb_league_id"], name=r["name"])
+            for r in rows
+        ]
     finally:
+        cur.close()
         conn.close()
 
 
-@app.get("/teams")
+@app.get("/teams", response_model=List[TeamInfo])
 def list_teams(
-    tsdb_league_id: int = Query(0, description="Filter by TSDB league id; 0 = all leagues"),
-    q: Optional[str] = Query(None, description="Optional name search"),
-    limit: int = Query(50, ge=1, le=200),
+    tsdb_league_id: Optional[int] = Query(
+        None,
+        description="Optional TSDB league id to filter teams. Use 0 for 'all leagues'.",
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Optional name filter (ILIKE).",
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=500,
+        description="Max number of teams to return.",
+    ),
 ):
+    """
+    List teams, optionally filtered by a TSDB league and/or name query.
+    """
     conn = get_conn()
+    cur = conn.cursor()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            params: List[Any] = []
-            where = []
+        params = []
+        if tsdb_league_id is not None and tsdb_league_id != 0:
+            league = _resolve_league(cur, tsdb_league_id)
+            league_id = league["league_id"]
 
-            if tsdb_league_id:
-                # limit to teams that have at least one season in this league
-                where.append("l.tsdb_league_id = %s")
-                params.append(tsdb_league_id)
+            sql = """
+                SELECT DISTINCT t.team_id, t.name
+                FROM teams t
+                JOIN team_season_stats tss
+                  ON tss.team_id = t.team_id
+                WHERE tss.league_id = %s
+            """
+            params.append(league_id)
 
             if q:
-                where.append("LOWER(t.name) LIKE %s")
-                params.append(f"%{q.lower()}%")
+                sql += " AND t.name ILIKE %s"
+                params.append(f"%{q}%")
 
-            where_sql = " AND ".join(where)
-            if where_sql:
-                where_sql = "WHERE " + where_sql
-
-            sql = f"""
-                SELECT DISTINCT
-                    t.team_id,
-                    t.name,
-                    t.short_name,
-                    t.abbreviation
-                FROM teams t
-                JOIN matches m
-                  ON m.home_team_id = t.team_id OR m.away_team_id = t.team_id
-                JOIN leagues l
-                  ON l.league_id = m.league_id
-                {where_sql}
-                ORDER BY t.name
-                LIMIT %s
-            """
+            sql += " ORDER BY t.name LIMIT %s"
             params.append(limit)
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            return {"teams": rows}
+        else:
+            sql = """
+                SELECT DISTINCT t.team_id, t.name
+                FROM teams t
+                WHERE 1=1
+            """
+            if q:
+                sql += " AND t.name ILIKE %s"
+                params.append(f"%{q}%")
+            sql += " ORDER BY t.name LIMIT %s"
+            params.append(limit)
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        return [TeamInfo(team_id=r["team_id"], name=r["name"]) for r in rows]
+
     finally:
+        cur.close()
         conn.close()
 
 
-@app.get("/standings/{tsdb_league_id}")
+# ---------------------------------------------------------------------------
+# /standings endpoint
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/standings/{tsdb_league_id}",
+    response_model=StandingsResponse,
+)
 def get_standings(
     tsdb_league_id: int,
-    season_label: Optional[str] = Query(None),
-    latest: bool = Query(False, description="If true, ignore season_label and use latest season"),
+    latest: bool = Query(
+        False,
+        description="If true, use the latest season for this league.",
+    ),
+    season_label: Optional[str] = Query(
+        None,
+        description="Explicit season label, e.g. '2025-2026'. Overrides latest if provided.",
+    ),
 ):
+    """
+    Get league table (standings) for a given TSDB league id and season.
+    """
     conn = get_conn()
+    cur = conn.cursor()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if latest or not season_label:
-                season_label = _load_latest_season_label(cur, tsdb_league_id)
+        league = _resolve_league(cur, tsdb_league_id)
+        league_id = league["league_id"]
+        league_name = league["name"]
 
-            cur.execute(
-                """
-                SELECT
-                    t.team_id,
-                    t.name AS team_name,
-                    s.label AS season_label,
-                    s.year,
-                    tss.games_played,
-                    tss.wins,
-                    tss.draws,
-                    tss.losses,
-                    tss.points_for,
-                    tss.points_against,
-                    tss.points_diff,
-                    tss.competition_points
-                FROM team_season_stats tss
-                JOIN teams t ON t.team_id = tss.team_id
-                JOIN seasons s ON s.season_id = tss.season_id
-                JOIN leagues l ON l.league_id = tss.league_id
-                WHERE l.tsdb_league_id = %s
-                  AND s.label = %s
-                ORDER BY tss.competition_points DESC, tss.points_diff DESC, t.team_id
-                """,
-                (tsdb_league_id, season_label),
+        season_label_resolved = _resolve_season_label(
+            cur,
+            league_id=league_id,
+            season_label=season_label if season_label else None,
+        )
+
+        cur.execute(
+            """
+            SELECT
+                s.label AS season_label,
+                tss.team_id,
+                t.name AS team_name,
+                tss.games_played,
+                tss.wins,
+                tss.draws,
+                tss.losses,
+                tss.points_for,
+                tss.points_against,
+                tss.points_diff,
+                tss.competition_points,
+                tss.losing_bonus_points,
+                tss.try_bonus_points
+            FROM team_season_stats tss
+            JOIN seasons s   ON s.season_id = tss.season_id
+            JOIN teams   t   ON t.team_id   = tss.team_id
+            WHERE tss.league_id = %s
+              AND s.label = %s
+            ORDER BY
+                tss.competition_points DESC,
+                tss.points_diff DESC,
+                tss.points_for DESC,
+                t.name ASC
+            """,
+            (league_id, season_label_resolved),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No standings data for tsdb_league_id={tsdb_league_id}, season='{season_label_resolved}'",
             )
-            rows = cur.fetchall()
-            return {
-                "tsdb_league_id": tsdb_league_id,
-                "season_label": season_label,
-                "standings": rows,
-            }
+
+        standings: List[StandingRow] = []
+        for idx, r in enumerate(rows, start=1):
+            standings.append(
+                StandingRow(
+                    position=idx,
+                    team_id=r["team_id"],
+                    team_name=r["team_name"],
+                    season_label=r["season_label"],
+                    games_played=r["games_played"],
+                    wins=r["wins"],
+                    draws=r["draws"],
+                    losses=r["losses"],
+                    points_for=r["points_for"],
+                    points_against=r["points_against"],
+                    points_diff=r["points_diff"],
+                    competition_points=r["competition_points"],
+                    losing_bonus_points=r["losing_bonus_points"],
+                    try_bonus_points=r["try_bonus_points"],
+                )
+            )
+
+        return StandingsResponse(
+            tsdb_league_id=tsdb_league_id,
+            league_name=league_name,
+            season_label=season_label_resolved,
+            rows=standings,
+        )
+
     finally:
+        cur.close()
         conn.close()
 
 
-@app.get("/compare-teams")
-def compare_teams(
-    team_a_id: int = Query(..., description="DB team_id for Team A"),
-    team_b_id: int = Query(..., description="DB team_id for Team B"),
-    last_n: int = Query(10, ge=1, le=100, description="How many recent matches to consider"),
-    tsdb_league_id: int = Query(0, description="Optional TSDB league filter; 0 = all leagues"),
+# ---------------------------------------------------------------------------
+# /headtohead endpoint
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/headtohead/{tsdb_league_id}",
+    response_model=HeadToHeadResponse,
+)
+def get_headtohead(
+    tsdb_league_id: int,
+    team_a: str = Query(..., description="Name (or part) of Team A"),
+    team_b: str = Query(..., description="Name (or part) of Team B"),
+    limit: int = Query(10, ge=1, le=100, description="Number of recent matches to consider"),
 ):
     """
-    Head-to-head comparison between two *franchises*.
+    Head-to-head stats between two teams:
 
-    If a team has aliases (e.g. Stormers / Western Province, Bulls / Blue Bulls),
-    we treat them as one combined group for the query and the stats. The display
-    name becomes e.g. 'Stormers (Western Province)'.
+    - If tsdb_league_id != 0: restrict to that league.
+    - If tsdb_league_id == 0: use ALL leagues in the DB.
+
+    Stats (wins, win rates, streak) are based ONLY on played matches
+    where home_score AND away_score are NOT NULL.
+
+    Upcoming fixtures (missing scores, kickoff in the future) are returned
+    in a separate 'upcoming' list and DO NOT affect percentages or streaks.
     """
     conn = get_conn()
+    cur = conn.cursor()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Resolve franchise groups for both sides
-            group_a = _get_team_group_ids_and_label(cur, team_a_id)
-            group_b = _get_team_group_ids_and_label(cur, team_b_id)
+        now_utc = datetime.utcnow()
 
-            team_a_ids: List[int] = group_a["team_ids"]
-            team_b_ids: List[int] = group_b["team_ids"]
+        if tsdb_league_id == 0:
+            league_name = "All leagues"
+            league_id = None
 
-            today = date.today()
+            team_a_row = _resolve_team_global(cur, team_a)
+            team_b_row = _resolve_team_global(cur, team_b)
 
-            params: List[Any] = [
-                team_a_ids,
-                team_b_ids,
-                team_b_ids,
-                team_a_ids,
-                today,
-            ]
+            team_a_id = team_a_row["team_id"]
+            team_a_name = team_a_row["name"]
+            team_b_id = team_b_row["team_id"]
+            team_b_name = team_b_row["name"]
 
-            league_filter = ""
-            if tsdb_league_id:
-                league_filter = "AND l.tsdb_league_id = %s"
-                params.append(tsdb_league_id)
+            base_where = """
+                (
+                    (m.home_team_id = %s AND m.away_team_id = %s) OR
+                    (m.home_team_id = %s AND m.away_team_id = %s)
+                )
+            """
+            base_params = (team_a_id, team_b_id, team_b_id, team_a_id)
 
-            sql_matches = f"""
+            sql_played = f"""
                 SELECT
                     m.match_id,
-                    m.kickoff_utc::date AS match_date,
                     s.label AS season_label,
-                    l.tsdb_league_id,
-                    l.name AS league_name,
-                    th.name AS home_team,
-                    ta.name AS away_team,
-                    m.home_team_id,
-                    m.away_team_id,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name,
                     m.home_score,
                     m.away_score
                 FROM matches m
-                JOIN leagues l ON l.league_id = m.league_id
                 JOIN seasons s ON s.season_id = m.season_id
-                JOIN teams th ON th.team_id = m.home_team_id
-                JOIN teams ta ON ta.team_id = m.away_team_id
-                WHERE
-                    (
-                        (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-                        OR
-                        (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-                    )
-                  AND m.kickoff_utc::date <= %s -- exclude future fixtures from stats
-                  {league_filter}
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND m.home_score IS NOT NULL
+                  AND m.away_score IS NOT NULL
                 ORDER BY m.kickoff_utc DESC
                 LIMIT %s
             """
-            params.append(last_n)
-
-            cur.execute(sql_matches, params)
-            all_matches = cur.fetchall()
-
-            # Only count matches that actually have a final score
-            played = [m for m in all_matches if m["home_score"] is not None and m["away_score"] is not None]
-
-            total_played = len(played)
-            wins_a = 0
-            wins_b = 0
-            draws = 0
-
-            # Compute W/L/D and also current streak from most recent backwards
-            current_streak_side = None  # "A" or "B"
-            current_streak_len = 0
-
-            for m in played:
-                hs = m["home_score"]
-                as_ = m["away_score"]
-                home_id = m["home_team_id"]
-                away_id = m["away_team_id"]
-
-                winner = None
-                if hs > as_:
-                    if home_id in team_a_ids:
-                        winner = "A"
-                    elif home_id in team_b_ids:
-                        winner = "B"
-                elif as_ > hs:
-                    if away_id in team_a_ids:
-                        winner = "A"
-                    elif away_id in team_b_ids:
-                        winner = "B"
-
-                if winner == "A":
-                    wins_a += 1
-                elif winner == "B":
-                    wins_b += 1
-                else:
-                    draws += 1
-
-            # Streak: re-iterate from most recent played match
-            for m in played:
-                hs = m["home_score"]
-                as_ = m["away_score"]
-                home_id = m["home_team_id"]
-                away_id = m["away_team_id"]
-
-                winner = None
-                if hs > as_:
-                    if home_id in team_a_ids:
-                        winner = "A"
-                    elif home_id in team_b_ids:
-                        winner = "B"
-                elif as_ > hs:
-                    if away_id in team_a_ids:
-                        winner = "A"
-                    elif away_id in team_b_ids:
-                        winner = "B"
-
-                if winner is None:
-                    break
-
-                if current_streak_side is None:
-                    current_streak_side = winner
-                    current_streak_len = 1
-                elif winner == current_streak_side:
-                    current_streak_len += 1
-                else:
-                    break
-
-            win_rate_a = (wins_a / total_played) * 100 if total_played else 0.0
-            win_rate_b = (wins_b / total_played) * 100 if total_played else 0.0
-
-            # Also fetch upcoming fixtures between these franchises, for UI to show separately
-            params_upcoming: List[Any] = [
-                team_a_ids,
-                team_b_ids,
-                team_b_ids,
-                team_a_ids,
-                today,
-            ]
-            if tsdb_league_id:
-                params_upcoming.append(tsdb_league_id)
-                league_filter_up = "AND l.tsdb_league_id = %s"
-            else:
-                league_filter_up = ""
+            params_played = base_params + (limit,)
 
             sql_upcoming = f"""
                 SELECT
                     m.match_id,
-                    m.kickoff_utc::date AS match_date,
                     s.label AS season_label,
-                    l.tsdb_league_id,
-                    l.name AS league_name,
-                    th.name AS home_team,
-                    ta.name AS away_team,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND (m.home_score IS NULL OR m.away_score IS NULL)
+                  AND m.kickoff_utc IS NOT NULL
+                  AND m.kickoff_utc >= %s
+                ORDER BY m.kickoff_utc ASC
+            """
+            params_upcoming = base_params + (now_utc,)
+        else:
+            league = _resolve_league(cur, tsdb_league_id)
+            league_id = league["league_id"]
+            league_name = league["name"]
+
+            team_a_row = _resolve_team_in_league(cur, league_id, team_a)
+            team_b_row = _resolve_team_in_league(cur, league_id, team_b)
+
+            team_a_id = team_a_row["team_id"]
+            team_a_name = team_a_row["name"]
+            team_b_id = team_b_row["team_id"]
+            team_b_name = team_b_row["name"]
+
+            base_where = """
+                m.league_id = %s
+                AND (
+                    (m.home_team_id = %s AND m.away_team_id = %s) OR
+                    (m.home_team_id = %s AND m.away_team_id = %s)
+                )
+            """
+            base_params = (league_id, team_a_id, team_b_id, team_b_id, team_a_id)
+
+            sql_played = f"""
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name,
                     m.home_score,
                     m.away_score
                 FROM matches m
-                JOIN leagues l ON l.league_id = m.league_id
                 JOIN seasons s ON s.season_id = m.season_id
-                JOIN teams th ON th.team_id = m.home_team_id
-                JOIN teams ta ON ta.team_id = m.away_team_id
-                WHERE
-                    (
-                        (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-                        OR
-                        (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-                    )
-                  AND m.kickoff_utc::date > %s
-                  {league_filter_up}
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND m.home_score IS NOT NULL
+                  AND m.away_score IS NOT NULL
+                ORDER BY m.kickoff_utc DESC
+                LIMIT %s
+            """
+            params_played = base_params + (limit,)
+
+            sql_upcoming = f"""
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND (m.home_score IS NULL OR m.away_score IS NULL)
+                  AND m.kickoff_utc IS NOT NULL
+                  AND m.kickoff_utc >= %s
                 ORDER BY m.kickoff_utc ASC
             """
-            cur.execute(sql_upcoming, params_upcoming)
-            upcoming = cur.fetchall()
+            params_upcoming = base_params + (now_utc,)
 
-            # Drop internal ids from the match list we return (keep it clean)
-            def _strip_ids(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-                out: List[Dict[str, Any]] = []
-                for r in rows:
-                    r2 = dict(r)
-                    r2.pop("home_team_id", None)
-                    r2.pop("away_team_id", None)
-                    out.append(r2)
-                return out
+        # Played matches
+        cur.execute(sql_played, params_played)
+        played_rows = cur.fetchall()
 
-            return {
-                "team_a": {
-                    "team_ids": team_a_ids,
-                    "name": group_a["display_name"],  # e.g. "Stormers (Western Province)"
-                    "canonical_name": group_a["canonical_name"],
-                },
-                "team_b": {
-                    "team_ids": team_b_ids,
-                    "name": group_b["display_name"],  # e.g. "Bulls (Blue Bulls)"
-                    "canonical_name": group_b["canonical_name"],
-                },
-                "total_played": total_played,
-                "wins_a": wins_a,
-                "wins_b": wins_b,
-                "draws": draws,
-                "win_rate_a": win_rate_a,
-                "win_rate_b": win_rate_b,
-                "current_streak_side": current_streak_side,
-                "current_streak_len": current_streak_len,
-                "matches": _strip_ids(played),
-                "upcoming": upcoming,
-            }
+        # Upcoming fixtures
+        cur.execute(sql_upcoming, params_upcoming)
+        upcoming_rows = cur.fetchall()
+
+        if not played_rows and not upcoming_rows:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No matches (played or upcoming) found between '{team_a_name}' and "
+                    f"'{team_b_name}' in tsdb_league_id={tsdb_league_id}"
+                ),
+            )
+
+        total_matches = 0
+        team_a_wins = 0
+        team_b_wins = 0
+        draws = 0
+        match_summaries: List[MatchSummary] = []
+
+        streak_type: Optional[str] = None  # "team_a_win", "team_b_win", "draw"
+        streak_length = 0
+
+        for idx, r in enumerate(played_rows):
+            total_matches += 1
+            hs = r["home_score"]
+            as_ = r["away_score"]
+
+            winner: Optional[str] = None
+            result_flag: Optional[str] = None
+
+            if hs is not None and as_ is not None:
+                if hs > as_:
+                    winner = "home"
+                elif as_ > hs:
+                    winner = "away"
+                else:
+                    winner = "draw"
+
+                if winner == "draw":
+                    draws += 1
+                    result_flag = "draw"
+                else:
+                    home_is_a = (r["home_team_id"] == team_a_id)
+                    away_is_a = (r["away_team_id"] == team_a_id)
+
+                    if winner == "home":
+                        if home_is_a:
+                            team_a_wins += 1
+                            result_flag = "team_a_win"
+                        else:
+                            team_b_wins += 1
+                            result_flag = "team_b_win"
+                    elif winner == "away":
+                        if away_is_a:
+                            team_a_wins += 1
+                            result_flag = "team_a_win"
+                        else:
+                            team_b_wins += 1
+                            result_flag = "team_b_win"
+
+            kickoff = r["kickoff_utc"]
+            if isinstance(kickoff, str):
+                try:
+                    kickoff = datetime.fromisoformat(kickoff)
+                except Exception:
+                    kickoff = None
+
+            match_summaries.append(
+                MatchSummary(
+                    match_id=r["match_id"],
+                    season_label=r["season_label"],
+                    kickoff_utc=kickoff,
+                    home_team_id=r["home_team_id"],
+                    home_team_name=r["home_team_name"],
+                    away_team_id=r["away_team_id"],
+                    away_team_name=r["away_team_name"],
+                    home_score=hs,
+                    away_score=as_,
+                    winner=winner,
+                )
+            )
+
+            if idx == 0:
+                streak_type = result_flag
+                streak_length = 1 if result_flag is not None else 0
+            else:
+                if result_flag is not None and result_flag == streak_type:
+                    streak_length += 1
+                else:
+                    break
+
+        if total_matches > 0:
+            team_a_win_rate = team_a_wins / total_matches
+            team_b_win_rate = team_b_wins / total_matches
+        else:
+            team_a_win_rate = 0.0
+            team_b_win_rate = 0.0
+
+        upcoming_list: List[FixtureSummary] = []
+        for r in upcoming_rows:
+            kickoff = r["kickoff_utc"]
+            if isinstance(kickoff, str):
+                try:
+                    kickoff = datetime.fromisoformat(kickoff)
+                except Exception:
+                    kickoff = None
+
+            upcoming_list.append(
+                FixtureSummary(
+                    match_id=r["match_id"],
+                    season_label=r["season_label"],
+                    kickoff_utc=kickoff,
+                    home_team_id=r["home_team_id"],
+                    home_team_name=r["home_team_name"],
+                    away_team_id=r["away_team_id"],
+                    away_team_name=r["away_team_name"],
+                )
+            )
+
+        return HeadToHeadResponse(
+            tsdb_league_id=tsdb_league_id,
+            league_name=league_name,
+            team_a_id=team_a_id,
+            team_a_name=team_a_name,
+            team_b_id=team_b_id,
+            team_b_name=team_b_name,
+            total_matches=total_matches,
+            team_a_wins=team_a_wins,
+            team_b_wins=team_b_wins,
+            draws=draws,
+            team_a_win_rate=team_a_win_rate,
+            team_b_win_rate=team_b_win_rate,
+            current_streak_type=streak_type,
+            current_streak_length=streak_length,
+            last_n=match_summaries,
+            upcoming=upcoming_list,
+        )
+
     finally:
+        cur.close()
         conn.close()
