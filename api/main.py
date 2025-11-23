@@ -326,6 +326,21 @@ INDEX_HTML = """<!DOCTYPE html>
           <tbody id="matches-body"></tbody>
         </table>
       </div>
+
+      <h3 style="margin-top:16px; display:none;" id="upcoming-title">Upcoming Fixtures</h3>
+      <div class="small" id="upcoming-label" style="display:none;"></div>
+      <div style="max-height:320px; overflow-y:auto; margin-top:4px; display:none;" id="upcoming-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Season</th>
+              <th>Match</th>
+            </tr>
+          </thead>
+          <tbody id="upcoming-body"></tbody>
+        </table>
+      </div>
     </section>
   </main>
 
@@ -448,7 +463,6 @@ INDEX_HTML = """<!DOCTYPE html>
           select.appendChild(opt);
         });
 
-        // Auto-select URC if present
         const defaultLeagueId = "4446";
         const hasDefault =
           Array.from(select.options).some((o) => o.value === defaultLeagueId);
@@ -474,7 +488,6 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
-    // Form handler
     document.getElementById("h2h-form").addEventListener("submit", async (e) => {
       e.preventDefault();
 
@@ -487,11 +500,19 @@ INDEX_HTML = """<!DOCTYPE html>
       const btn = document.getElementById("submit-btn");
       const resultsCard = document.getElementById("results-card");
       const matchesBody = document.getElementById("matches-body");
+      const upcomingTitle = document.getElementById("upcoming-title");
+      const upcomingLabel = document.getElementById("upcoming-label");
+      const upcomingContainer = document.getElementById("upcoming-container");
+      const upcomingBody = document.getElementById("upcoming-body");
 
       errorEl.style.display = "none";
       errorEl.textContent = "";
       resultsCard.style.display = "none";
       matchesBody.innerHTML = "";
+      upcomingBody.innerHTML = "";
+      upcomingTitle.style.display = "none";
+      upcomingLabel.style.display = "none";
+      upcomingContainer.style.display = "none";
 
       if (!leagueId) {
         errorEl.textContent = "Please select a league (or 'All leagues').";
@@ -520,7 +541,6 @@ INDEX_HTML = """<!DOCTYPE html>
           params.toString();
         const data = await fetchJSON(url);
 
-        // Summary top section
         document.getElementById("results-title").textContent =
           "Head-to-head: " + data.team_a_name + " vs " + data.team_b_name;
         document.getElementById("teams-label").textContent =
@@ -537,7 +557,7 @@ INDEX_HTML = """<!DOCTYPE html>
           data.draws +
           " draw(s) across " +
           data.total_matches +
-          " matches";
+          " played matches";
 
         document.getElementById("win-rates").textContent =
           percent(data.team_a_win_rate) +
@@ -565,14 +585,13 @@ INDEX_HTML = """<!DOCTYPE html>
         }
         document.getElementById("streak").textContent = streakText;
         document.getElementById("streak-extra").textContent =
-          "Based on most recent head-to-head matches";
+          "Based on most recent played head-to-head matches";
 
         document.getElementById("last-n-label").textContent =
           "Showing up to " +
           data.last_n.length +
-          " most recent matches between these teams.";
+          " most recent played matches between these teams.";
 
-        // Table of matches
         for (const row of data.last_n) {
           const tr = document.createElement("tr");
 
@@ -616,6 +635,33 @@ INDEX_HTML = """<!DOCTYPE html>
           matchesBody.appendChild(tr);
         }
 
+        if (data.upcoming && data.upcoming.length > 0) {
+          upcomingTitle.style.display = "block";
+          upcomingLabel.style.display = "block";
+          upcomingContainer.style.display = "block";
+          upcomingLabel.textContent =
+            "Upcoming fixtures between these teams (not included in streak/win rates).";
+
+          for (const row of data.upcoming) {
+            const tr = document.createElement("tr");
+
+            const tdDate = document.createElement("td");
+            tdDate.textContent = formatDate(row.kickoff_utc);
+            tr.appendChild(tdDate);
+
+            const tdSeason = document.createElement("td");
+            tdSeason.textContent = row.season_label || "-";
+            tr.appendChild(tdSeason);
+
+            const tdMatch = document.createElement("td");
+            tdMatch.textContent =
+              row.home_team_name + " vs " + row.away_team_name;
+            tr.appendChild(tdMatch);
+
+            upcomingBody.appendChild(tr);
+          }
+        }
+
         resultsCard.style.display = "block";
       } catch (err) {
         console.error(err);
@@ -626,7 +672,6 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     });
 
-    // Kick off initial load
     loadLeagues();
   </script>
 </body>
@@ -675,6 +720,16 @@ class MatchSummary(BaseModel):
     winner: Optional[str]
 
 
+class FixtureSummary(BaseModel):
+    match_id: int
+    season_label: str
+    kickoff_utc: Optional[datetime]
+    home_team_id: int
+    home_team_name: str
+    away_team_id: int
+    away_team_name: str
+
+
 class HeadToHeadResponse(BaseModel):
     tsdb_league_id: int
     league_name: str
@@ -682,7 +737,7 @@ class HeadToHeadResponse(BaseModel):
     team_a_name: str
     team_b_id: int
     team_b_name: str
-    total_matches: int
+    total_matches: int  # number of PLAYED matches
     team_a_wins: int
     team_b_wins: int
     draws: int
@@ -690,7 +745,8 @@ class HeadToHeadResponse(BaseModel):
     team_b_win_rate: float
     current_streak_type: Optional[str]
     current_streak_length: int
-    last_n: List[MatchSummary]
+    last_n: List[MatchSummary]          # last N played matches
+    upcoming: List[FixtureSummary]      # future fixtures (not in streak/win rate)
 
 
 class LeagueInfo(BaseModel):
@@ -709,7 +765,7 @@ class TeamInfo(BaseModel):
 
 app = FastAPI(
     title="Rugby Analytics API",
-    version="0.4.0",
+    version="0.5.0",
     description="API exposing rugby standings and head-to-head stats, plus a simple UI.",
 )
 
@@ -777,7 +833,6 @@ def _resolve_season_label(cur, league_id: int, season_label: Optional[str]) -> s
             )
         return row["label"]
 
-    # No season_label provided -> pick latest by year
     cur.execute(
         """
         SELECT label
@@ -899,7 +954,6 @@ def list_teams(
     try:
         params = []
         if tsdb_league_id is not None and tsdb_league_id != 0:
-            # Resolve to league_id
             league = _resolve_league(cur, tsdb_league_id)
             league_id = league["league_id"]
 
@@ -919,7 +973,6 @@ def list_teams(
             sql += " ORDER BY t.name LIMIT %s"
             params.append(limit)
         else:
-            # All leagues
             sql = """
                 SELECT DISTINCT t.team_id, t.name
                 FROM teams t
@@ -1065,16 +1118,17 @@ def get_headtohead(
     - If tsdb_league_id != 0: restrict to that league.
     - If tsdb_league_id == 0: use ALL leagues in the DB.
 
-    Returns:
+    Stats (wins, win rates, streak) are based ONLY on played matches
+    where home_score AND away_score are NOT NULL.
 
-    - Last N matches (up to `limit`)
-    - Total wins/draws
-    - Win rates
-    - Current streak in the matchup
+    Upcoming fixtures (missing scores, kickoff in the future) are returned
+    in a separate 'upcoming' list and DO NOT affect percentages or streaks.
     """
     conn = get_conn()
     cur = conn.cursor()
     try:
+        now_utc = datetime.utcnow()
+
         if tsdb_league_id == 0:
             league_name = "All leagues"
             league_id = None
@@ -1087,8 +1141,15 @@ def get_headtohead(
             team_b_id = team_b_row["team_id"]
             team_b_name = team_b_row["name"]
 
-            cur.execute(
-                """
+            base_where = """
+                (
+                    (m.home_team_id = %s AND m.away_team_id = %s) OR
+                    (m.home_team_id = %s AND m.away_team_id = %s)
+                )
+            """
+            base_params = (team_a_id, team_b_id, team_b_id, team_a_id)
+
+            sql_played = f"""
                 SELECT
                     m.match_id,
                     s.label AS season_label,
@@ -1103,16 +1164,34 @@ def get_headtohead(
                 JOIN seasons s ON s.season_id = m.season_id
                 JOIN teams ht ON ht.team_id = m.home_team_id
                 JOIN teams at ON at.team_id = m.away_team_id
-                WHERE
-                    (
-                        (m.home_team_id = %s AND m.away_team_id = %s) OR
-                        (m.home_team_id = %s AND m.away_team_id = %s)
-                    )
+                WHERE {base_where}
+                  AND m.home_score IS NOT NULL
+                  AND m.away_score IS NOT NULL
                 ORDER BY m.kickoff_utc DESC
                 LIMIT %s
-                """,
-                (team_a_id, team_b_id, team_b_id, team_a_id, limit),
-            )
+            """
+            params_played = base_params + (limit,)
+
+            sql_upcoming = f"""
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND (m.home_score IS NULL OR m.away_score IS NULL)
+                  AND m.kickoff_utc IS NOT NULL
+                  AND m.kickoff_utc >= %s
+                ORDER BY m.kickoff_utc ASC
+            """
+            params_upcoming = base_params + (now_utc,)
         else:
             league = _resolve_league(cur, tsdb_league_id)
             league_id = league["league_id"]
@@ -1126,8 +1205,16 @@ def get_headtohead(
             team_b_id = team_b_row["team_id"]
             team_b_name = team_b_row["name"]
 
-            cur.execute(
-                """
+            base_where = """
+                m.league_id = %s
+                AND (
+                    (m.home_team_id = %s AND m.away_team_id = %s) OR
+                    (m.home_team_id = %s AND m.away_team_id = %s)
+                )
+            """
+            base_params = (league_id, team_a_id, team_b_id, team_b_id, team_a_id)
+
+            sql_played = f"""
                 SELECT
                     m.match_id,
                     s.label AS season_label,
@@ -1142,25 +1229,49 @@ def get_headtohead(
                 JOIN seasons s ON s.season_id = m.season_id
                 JOIN teams ht ON ht.team_id = m.home_team_id
                 JOIN teams at ON at.team_id = m.away_team_id
-                WHERE m.league_id = %s
-                  AND (
-                        (m.home_team_id = %s AND m.away_team_id = %s) OR
-                        (m.home_team_id = %s AND m.away_team_id = %s)
-                      )
+                WHERE {base_where}
+                  AND m.home_score IS NOT NULL
+                  AND m.away_score IS NOT NULL
                 ORDER BY m.kickoff_utc DESC
                 LIMIT %s
-                """,
-                (league_id, team_a_id, team_b_id, team_b_id, team_a_id, limit),
-            )
+            """
+            params_played = base_params + (limit,)
 
-        rows = cur.fetchall()
+            sql_upcoming = f"""
+                SELECT
+                    m.match_id,
+                    s.label AS season_label,
+                    m.kickoff_utc,
+                    ht.team_id AS home_team_id,
+                    ht.name    AS home_team_name,
+                    at.team_id AS away_team_id,
+                    at.name    AS away_team_name
+                FROM matches m
+                JOIN seasons s ON s.season_id = m.season_id
+                JOIN teams ht ON ht.team_id = m.home_team_id
+                JOIN teams at ON at.team_id = m.away_team_id
+                WHERE {base_where}
+                  AND (m.home_score IS NULL OR m.away_score IS NULL)
+                  AND m.kickoff_utc IS NOT NULL
+                  AND m.kickoff_utc >= %s
+                ORDER BY m.kickoff_utc ASC
+            """
+            params_upcoming = base_params + (now_utc,)
 
-        if not rows:
+        # Played matches
+        cur.execute(sql_played, params_played)
+        played_rows = cur.fetchall()
+
+        # Upcoming fixtures
+        cur.execute(sql_upcoming, params_upcoming)
+        upcoming_rows = cur.fetchall()
+
+        if not played_rows and not upcoming_rows:
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"No matches found between '{team_a_name}' and '{team_b_name}' "
-                    f"in tsdb_league_id={tsdb_league_id}"
+                    f"No matches (played or upcoming) found between '{team_a_name}' and "
+                    f"'{team_b_name}' in tsdb_league_id={tsdb_league_id}"
                 ),
             )
 
@@ -1173,7 +1284,7 @@ def get_headtohead(
         streak_type: Optional[str] = None  # "team_a_win", "team_b_win", "draw"
         streak_length = 0
 
-        for idx, r in enumerate(rows):
+        for idx, r in enumerate(played_rows):
             total_matches += 1
             hs = r["home_score"]
             as_ = r["away_score"]
@@ -1249,6 +1360,27 @@ def get_headtohead(
             team_a_win_rate = 0.0
             team_b_win_rate = 0.0
 
+        upcoming_list: List[FixtureSummary] = []
+        for r in upcoming_rows:
+            kickoff = r["kickoff_utc"]
+            if isinstance(kickoff, str):
+                try:
+                    kickoff = datetime.fromisoformat(kickoff)
+                except Exception:
+                    kickoff = None
+
+            upcoming_list.append(
+                FixtureSummary(
+                    match_id=r["match_id"],
+                    season_label=r["season_label"],
+                    kickoff_utc=kickoff,
+                    home_team_id=r["home_team_id"],
+                    home_team_name=r["home_team_name"],
+                    away_team_id=r["away_team_id"],
+                    away_team_name=r["away_team_name"],
+                )
+            )
+
         return HeadToHeadResponse(
             tsdb_league_id=tsdb_league_id,
             league_name=league_name,
@@ -1265,6 +1397,7 @@ def get_headtohead(
             current_streak_type=streak_type,
             current_streak_length=streak_length,
             last_n=match_summaries,
+            upcoming=upcoming_list,
         )
 
     finally:
