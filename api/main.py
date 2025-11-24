@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Rugby Analytics Backend – v1.0.0 (api.main, ID-based H2H, alias-aware, no 404 on empty matches)
+# Rugby Analytics Backend – v1.0.1 (api.main, ID-based H2H, alias-aware, no 404 on empty matches)
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
-API_VERSION = "1.0.0"
+API_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
 # Env + DB helpers
@@ -65,7 +65,7 @@ def normalise_name(name: str) -> str:
     - stripping punctuation
     - collapsing whitespace
 
-    So:
+    Example:
       "DHL Stormers"         -> "stormers"
       "Vodacom Bulls"        -> "bulls"
       "Hollywoodbets Sharks" -> "sharks"
@@ -96,7 +96,7 @@ def normalise_name(name: str) -> str:
 
 # Each set = one "club" in ALL LEAGUES MODE (tsdb_league_id == 0)
 CLUB_ALIAS_GROUPS: List[Set[str]] = [
-    # South African clubs – exactly as you specified
+    # South African clubs – exactly as specified
     {"bulls", "blue bulls", "northern transvaal", "vodacom bulls", "pretoria bulls"},
     {"stormers", "western province", "wp", "western stormers", "dhl stormers"},
     {"sharks", "natal sharks", "natal", "sharks xv", "cell c sharks", "hollywoodbets sharks"},
@@ -627,7 +627,7 @@ def list_teams(
 
 @app.get("/standings/{tsdb_league_id}", response_model=StandingsResponse)
 def get_standings(
-    tsdb_league_id: int,
+    tsdb_league_id: int,  # PATH PARAM – no Query()
     season_label: Optional[str] = Query(
         None,
         description="Season label (e.g. '2023-2024'). If omitted, use the latest season.",
@@ -719,13 +719,7 @@ def get_standings(
     response_model=HeadToHeadResponse,
 )
 def head_to_head(
-    tsdb_league_id: int = Query(
-        ...,
-        description=(
-            "External TSDB league id. Use 0 for 'all leagues' mode "
-            "with club alias groups (Bulls / Blue Bulls, Stormers / WP, etc.)."
-        ),
-    ),
+    tsdb_league_id: int,  # PATH PARAM – no Query() here
     team_a: str = Query(..., description="Team A name (alias-aware)."),
     team_b: str = Query(..., description="Team B name (alias-aware)."),
     limit: int = Query(
@@ -907,7 +901,7 @@ def head_to_head(
 
 
 # ---------------------------------------------------------------------------
-# Minimal index (your real UI is in /static/index.html)
+# Minimal index (your main UI is /static/index.html)
 # ---------------------------------------------------------------------------
 
 INDEX_HTML = f"""
@@ -918,8 +912,8 @@ INDEX_HTML = f"""
   <title>Rugby Head-to-Head</title>
 </head>
 <body>
-  <h1>Rugby Analytics · v{API_VERSION}</h1>
-  <p>Backend is running (api.main). Use the /static/index.html UI for the full experience.</p>
+  <h1>Rugby Analytics API · v{API_VERSION}</h1>
+  <p>Backend running from api.main. Use /static/index.html for the full UI.</p>
 </body>
 </html>
 """
