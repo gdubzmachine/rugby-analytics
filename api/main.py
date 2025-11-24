@@ -35,7 +35,7 @@ API_VERSION = "1.0.3"
 #   postgresql://rugby_analytics_user:...@dpg-d4grdq.../rugby_analytics
 #
 # Paste that EXACT string below instead of "PASTE_YOUR_POSTGRES_URL_HERE"
-DEFAULT_DATABASE_URL = "PASTE_YOUR_POSTGRES_URL_HERE"
+DEFAULT_DATABASE_URL = "postgresql://rugby_analytics_user:a5tDWnLOBdGEqSQGEcEjfiXaSbIlFksT@dpg-d4grdqili9vc73dqbtf0-a.oregon-postgres.render.com/rugby_analytics"
 
 # If you prefer, you can also set DATABASE_URL_FALLBACK as an env var
 # and leave DEFAULT_DATABASE_URL as-is:
