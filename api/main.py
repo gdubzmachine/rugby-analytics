@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Rugby Analytics Backend – v1.0.1 (api.main, ID-based H2H, alias-aware, no 404 on empty matches)
+# Rugby Analytics API – v1.0.2 (api.main, ID-based H2H, alias-aware, safe error reporting)
 
 from __future__ import annotations
 
@@ -18,13 +18,13 @@ from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
-API_VERSION = "1.0.1"
+API_VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # Env + DB helpers
 # ---------------------------------------------------------------------------
 
-load_dotenv()  # for local dev; no-op on Render if env vars already set
+load_dotenv()  # local dev; no-op on Render if env vars are set
 
 
 def get_conn():
@@ -64,13 +64,6 @@ def normalise_name(name: str) -> str:
       Toyota, Hollywoodbets, "The")
     - stripping punctuation
     - collapsing whitespace
-
-    Example:
-      "DHL Stormers"         -> "stormers"
-      "Vodacom Bulls"        -> "bulls"
-      "Hollywoodbets Sharks" -> "sharks"
-      "Toyota Cheetahs"      -> "cheetahs"
-      "The Sharks"           -> "sharks"
     """
     import re
 
@@ -94,9 +87,9 @@ def normalise_name(name: str) -> str:
     return name
 
 
-# Each set = one "club" in ALL LEAGUES MODE (tsdb_league_id == 0)
+# Each set = one "club" when tsdb_league_id == 0 (ALL LEAGUES mode)
 CLUB_ALIAS_GROUPS: List[Set[str]] = [
-    # South African clubs – exactly as specified
+    # South African clubs – exactly as you specified
     {"bulls", "blue bulls", "northern transvaal", "vodacom bulls", "pretoria bulls"},
     {"stormers", "western province", "wp", "western stormers", "dhl stormers"},
     {"sharks", "natal sharks", "natal", "sharks xv", "cell c sharks", "hollywoodbets sharks"},
@@ -627,7 +620,7 @@ def list_teams(
 
 @app.get("/standings/{tsdb_league_id}", response_model=StandingsResponse)
 def get_standings(
-    tsdb_league_id: int,  # PATH PARAM – no Query()
+    tsdb_league_id: int,
     season_label: Optional[str] = Query(
         None,
         description="Season label (e.g. '2023-2024'). If omitted, use the latest season.",
@@ -719,7 +712,7 @@ def get_standings(
     response_model=HeadToHeadResponse,
 )
 def head_to_head(
-    tsdb_league_id: int,  # PATH PARAM – no Query() here
+    tsdb_league_id: int,
     team_a: str = Query(..., description="Team A name (alias-aware)."),
     team_b: str = Query(..., description="Team B name (alias-aware)."),
     limit: int = Query(
@@ -732,172 +725,181 @@ def head_to_head(
     """
     Head-to-head stats between two teams/clubs.
 
-    IMPORTANT:
     - Only 404s when league or teams are missing.
     - If no matches exist after resolving IDs, returns total_matches=0.
-      It does NOT raise an HTTP error like 'No matches (played or upcoming)...'.
+    - Any unexpected error becomes a JSON error with detail.
     """
-    league = None
-    league_id: Optional[int] = None
-    league_name: Optional[str] = None
+    try:
+        league = None
+        league_id: Optional[int] = None
+        league_name: Optional[str] = None
 
-    if tsdb_league_id != 0:
-        league = resolve_league_by_tsdb(tsdb_league_id)
-        if not league:
-            raise HTTPException(status_code=404, detail="League not found")
-        league_id = league["id"]
-        league_name = league["name"]
+        if tsdb_league_id != 0:
+            league = resolve_league_by_tsdb(tsdb_league_id)
+            if not league:
+                raise HTTPException(status_code=404, detail="League not found")
+            league_id = league["id"]
+            league_name = league["name"]
 
-    # Resolve clubs/teams to team_ids
-    if tsdb_league_id == 0:
-        team_a_ids, team_a_display_name = resolve_club_team_ids_all_leagues(team_a)
-        team_b_ids, team_b_display_name = resolve_club_team_ids_all_leagues(team_b)
+        # Resolve clubs/teams to team_ids
+        if tsdb_league_id == 0:
+            team_a_ids, team_a_display_name = resolve_club_team_ids_all_leagues(team_a)
+            team_b_ids, team_b_display_name = resolve_club_team_ids_all_leagues(team_b)
 
-        if not team_a_ids:
-            raise HTTPException(status_code=404, detail=f"Team A not found: {team_a}")
-        if not team_b_ids:
-            raise HTTPException(status_code=404, detail=f"Team B not found: {team_b}")
-    else:
-        assert league_id is not None
-        team_a_row = resolve_team_in_league(league_id, team_a)
-        team_b_row = resolve_team_in_league(league_id, team_b)
+            if not team_a_ids:
+                raise HTTPException(status_code=404, detail=f"Team A not found: {team_a}")
+            if not team_b_ids:
+                raise HTTPException(status_code=404, detail=f"Team B not found: {team_b}")
+        else:
+            assert league_id is not None
+            team_a_row = resolve_team_in_league(league_id, team_a)
+            team_b_row = resolve_team_in_league(league_id, team_b)
 
-        if not team_a_row:
-            raise HTTPException(status_code=404, detail=f"Team A not found: {team_a}")
-        if not team_b_row:
-            raise HTTPException(status_code=404, detail=f"Team B not found: {team_b}")
+            if not team_a_row:
+                raise HTTPException(status_code=404, detail=f"Team A not found: {team_a}")
+            if not team_b_row:
+                raise HTTPException(status_code=404, detail=f"Team B not found: {team_b}")
 
-        team_a_ids = [team_a_row["id"]]
-        team_b_ids = [team_b_row["id"]]
-        team_a_display_name = team_a_row["name"]
-        team_b_display_name = team_b_row["name"]
+            team_a_ids = [team_a_row["id"]]
+            team_b_ids = [team_b_row["id"]]
+            team_a_display_name = team_a_row["name"]
+            team_b_display_name = team_b_row["name"]
 
-    team_a_ids_set: Set[int] = set(team_a_ids)
-    team_b_ids_set: Set[int] = set(team_b_ids)
+        team_a_ids_set: Set[int] = set(team_a_ids)
+        team_b_ids_set: Set[int] = set(team_b_ids)
 
-    # Played matches
-    params: List[Any] = [team_a_ids, team_b_ids, team_b_ids, team_a_ids]
-    league_filter = ""
-    if league_id is not None:
-        league_filter = " AND m.league_id = %s"
-        params.append(league_id)
+        # Played matches
+        params: List[Any] = [team_a_ids, team_b_ids, team_b_ids, team_a_ids]
+        league_filter = ""
+        if league_id is not None:
+            league_filter = " AND m.league_id = %s"
+            params.append(league_id)
 
-    params.append(limit)
+        params.append(limit)
 
-    rows = fetch_all(
-        f"""
-        SELECT
-            m.id          AS match_id,
-            m.kickoff_utc AS kickoff_utc,
-            m.home_team_id,
-            m.away_team_id,
-            h.name        AS home_team,
-            a.name        AS away_team,
-            m.home_score,
-            m.away_score,
-            v.name        AS venue,
-            l.name        AS league,
-            s.label       AS season
-        FROM matches m
-        JOIN teams h
-          ON h.id = m.home_team_id
-        JOIN teams a
-          ON a.id = m.away_team_id
-        LEFT JOIN venues v
-          ON v.id = m.venue_id
-        LEFT JOIN seasons s
-          ON s.id = m.season_id
-        LEFT JOIN leagues l
-          ON l.id = m.league_id
-        WHERE
-          (
-            (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
-            (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-          )
-          {league_filter}
-        ORDER BY m.kickoff_utc DESC
-        LIMIT %s
-        """,
-        tuple(params),
-    )
+        rows = fetch_all(
+            f"""
+            SELECT
+                m.id          AS match_id,
+                m.kickoff_utc AS kickoff_utc,
+                m.home_team_id,
+                m.away_team_id,
+                h.name        AS home_team,
+                a.name        AS away_team,
+                m.home_score,
+                m.away_score,
+                v.name        AS venue,
+                l.name        AS league,
+                s.label       AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+              )
+              {league_filter}
+            ORDER BY m.kickoff_utc DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
 
-    last_matches = [_build_match_summary_row(r) for r in rows]
+        last_matches = [_build_match_summary_row(r) for r in rows]
 
-    # Upcoming fixtures (future kickoffs)
-    upcoming_params: List[Any] = [team_a_ids, team_b_ids, team_b_ids, team_a_ids]
-    upcoming_league_filter = ""
-    if league_id is not None:
-        upcoming_league_filter = " AND m.league_id = %s"
-        upcoming_params.append(league_id)
+        # Upcoming fixtures (future kickoffs)
+        upcoming_params: List[Any] = [team_a_ids, team_b_ids, team_b_ids, team_a_ids]
+        upcoming_league_filter = ""
+        if league_id is not None:
+            upcoming_league_filter = " AND m.league_id = %s"
+            upcoming_params.append(league_id)
 
-    upcoming_rows = fetch_all(
-        f"""
-        SELECT
-            m.id          AS match_id,
-            m.kickoff_utc AS kickoff_utc,
-            m.home_team_id,
-            m.away_team_id,
-            h.name        AS home_team,
-            a.name        AS away_team,
-            v.name        AS venue,
-            l.name        AS league,
-            s.label       AS season
-        FROM matches m
-        JOIN teams h
-          ON h.id = m.home_team_id
-        JOIN teams a
-          ON a.id = m.away_team_id
-        LEFT JOIN venues v
-          ON v.id = m.venue_id
-        LEFT JOIN seasons s
-          ON s.id = m.season_id
-        LEFT JOIN leagues l
-          ON l.id = m.league_id
-        WHERE
-          (
-            (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
-            (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
-          )
-          {upcoming_league_filter}
-          AND m.kickoff_utc >= NOW()
-        ORDER BY m.kickoff_utc ASC
-        """,
-        tuple(upcoming_params),
-    )
+        upcoming_rows = fetch_all(
+            f"""
+            SELECT
+                m.id          AS match_id,
+                m.kickoff_utc AS kickoff_utc,
+                m.home_team_id,
+                m.away_team_id,
+                h.name        AS home_team,
+                a.name        AS away_team,
+                v.name        AS venue,
+                l.name        AS league,
+                s.label       AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+              )
+              {upcoming_league_filter}
+              AND m.kickoff_utc >= NOW()
+            ORDER BY m.kickoff_utc ASC
+            """,
+            tuple(upcoming_params),
+        )
 
-    upcoming_fixtures = [_build_fixture_summary_row(r) for r in upcoming_rows]
+        upcoming_fixtures = [_build_fixture_summary_row(r) for r in upcoming_rows]
 
-    # Stats (never raises on "no matches")
-    stats = compute_head_to_head_stats_from_rows(
-        rows,
-        team_a_ids_set,
-        team_b_ids_set,
-        team_a_display_name,
-        team_b_display_name,
-    )
+        # Stats (never raises on "no matches")
+        stats = compute_head_to_head_stats_from_rows(
+            rows,
+            team_a_ids_set,
+            team_b_ids_set,
+            team_a_display_name,
+            team_b_display_name,
+        )
 
-    team_a_canonical_id = team_a_ids[0] if team_a_ids else None
-    team_b_canonical_id = team_b_ids[0] if team_b_ids else None
+        team_a_canonical_id = team_a_ids[0] if team_a_ids else None
+        team_b_canonical_id = team_b_ids[0] if team_b_ids else None
 
-    return HeadToHeadResponse(
-        league_id=league_id,
-        league_name=league_name,
-        tsdb_league_id=tsdb_league_id,
-        team_a_id=team_a_canonical_id,
-        team_b_id=team_b_canonical_id,
-        team_a_name=team_a_display_name,
-        team_b_name=team_b_display_name,
-        total_matches=stats["total"],
-        team_a_wins=stats["team_a_wins"],
-        team_b_wins=stats["team_b_wins"],
-        draws=stats["draws"],
-        team_a_win_rate=stats["team_a_rate"],
-        team_b_win_rate=stats["team_b_rate"],
-        draws_rate=stats["draw_rate"],
-        current_streak=stats["current_streak"],
-        last_matches=last_matches,
-        upcoming_fixtures=upcoming_fixtures,
-    )
+        return HeadToHeadResponse(
+            league_id=league_id,
+            league_name=league_name,
+            tsdb_league_id=tsdb_league_id,
+            team_a_id=team_a_canonical_id,
+            team_b_id=team_b_canonical_id,
+            team_a_name=team_a_display_name,
+            team_b_name=team_b_display_name,
+            total_matches=stats["total"],
+            team_a_wins=stats["team_a_wins"],
+            team_b_wins=stats["team_b_wins"],
+            draws=stats["draws"],
+            team_a_win_rate=stats["team_a_rate"],
+            team_b_win_rate=stats["team_b_rate"],
+            draws_rate=stats["draw_rate"],
+            current_streak=stats["current_streak"],
+            last_matches=last_matches,
+            upcoming_fixtures=upcoming_fixtures,
+        )
+    except HTTPException:
+        # re-raise HTTP errors as-is (404 for missing teams/league)
+        raise
+    except Exception as exc:
+        # This is the key: you now get a JSON message with the real error
+        raise HTTPException(
+            status_code=500,
+            detail=f"H2H internal error: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------
