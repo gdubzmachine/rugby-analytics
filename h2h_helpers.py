@@ -16,7 +16,6 @@ Shared helpers for Rugby Analytics:
 from __future__ import annotations
 
 import os
-import datetime as dt
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg2
@@ -61,6 +60,52 @@ def fetch_all(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
             cur.execute(query, params)
             rows = cur.fetchall()
     return list(rows)
+
+
+# ---------------------------------------------------------------------------
+# Name normalisation
+# ---------------------------------------------------------------------------
+
+
+def normalise_name(name: str) -> str:
+    """
+    Normalise team names by:
+    - making lowercase
+    - removing common sponsor prefixes (DHL, Vodacom, Cell C, Emirates, MTN, Toyota, Hollywoodbets, etc.)
+    - stripping punctuation
+    - collapsing whitespace
+
+    This is critical so that DB names like:
+      "DHL Stormers" -> "stormers"
+      "Vodacom Bulls" -> "bulls"
+      "Hollywoodbets Sharks" -> "sharks"
+      "Toyota Cheetahs" -> "cheetahs"
+    match the alias groups.
+    """
+    import re
+
+    name = name.lower()
+
+    # remove sponsor / branding prefixes and common noise words
+    sponsor_patterns = [
+        r"\bdhl\b",
+        r"\bvodacom\b",
+        r"\bcell c\b",
+        r"\bhollywoodbets\b",
+        r"\bemirates\b",
+        r"\bmtn\b",
+        r"\btoyota\b",
+        r"\bthe\b",
+    ]
+    for sp in sponsor_patterns:
+        name = re.sub(sp, "", name)
+
+    # remove punctuation/noise characters
+    name = re.sub(r"[^\w\s]", "", name)
+
+    # collapse whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -135,63 +180,20 @@ CLUB_ALIAS_GROUPS: List[Set[str]] = [
 ]
 
 
-def normalise_name(name: str) -> str:
-    """
-    Lowercase and strip punctuation-ish noise for equality matching.
-    """
-    import re
-
-    name = name.lower()
-    name = re.sub(r"[^\w\s]", "", name)  # remove punctuation
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
-
-
 def find_alias_group(name: str) -> Optional[Set[str]]:
     """
     Return the alias group that contains `name` (by normalised equality), or None.
 
-    This is used to decide *which club* a query like "Stormers" or "WP"
-    refers to. It does NOT do substring checks; we want to be conservative.
+    This is used to decide *which club* a query like "Stormers" or "Blue Bulls"
+    refers to. It does NOT do substring checks; we want to be conservative and
+    only match exactly (after normalisation).
     """
     norm = normalise_name(name)
     for group in CLUB_ALIAS_GROUPS:
-        if norm in {normalise_name(x) for x in group}:
+        norm_group = {normalise_name(x) for x in group}
+        if norm in norm_group:
             return group
     return None
-
-
-def resolve_club_team_ids_all_leagues(team_name: str) -> Tuple[List[int], str]:
-    """
-    For tsdb_league_id == 0 (ALL leagues mode):
-
-    - If team_name belongs to an alias group, find ALL team_ids whose
-      normalised name matches any alias in that group.
-    - If nothing matches, fall back to a single global team lookup.
-    - Returns: (team_ids, representative_display_name).
-
-    This is *club → team_ids* logic. Everything else stays team_id-based.
-    """
-    alias_group = find_alias_group(team_name)
-    if alias_group:
-        group_norms = {normalise_name(x) for x in alias_group}
-
-        rows = fetch_all("SELECT id, name FROM teams")
-        club_rows: List[Dict[str, Any]] = [
-            r for r in rows if normalise_name(r["name"]) in group_norms
-        ]
-
-        if club_rows:
-            ids = [r["id"] for r in club_rows]
-            # Use the first DB name as "nice" display (e.g. 'Stormers' or 'DHL Stormers')
-            rep_name = club_rows[0]["name"]
-            return ids, rep_name
-
-    # Fallback: no alias group or nothing matched in DB → just pick one team globally
-    row = resolve_team_global(team_name)
-    if not row:
-        return [], team_name
-    return [row["id"]], row["name"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +291,14 @@ def resolve_team_in_league(league_id: int, team_name: str) -> Optional[Dict[str,
           AND t.name ILIKE %s
         LIMIT 1
         """,
-        (league_id, f"%{team_name}%"),
+        (league_id, f"%{team_name}%",),
     )
     return row
 
 
 def resolve_team_global(team_name: str) -> Optional[Dict[str, Any]]:
     """
-    Simpler global team resolve.
+    Global team resolve, used as a fallback when no alias group matches.
 
     We try:
     - direct LOWER(name) match
@@ -326,6 +328,40 @@ def resolve_team_global(team_name: str) -> Optional[Dict[str, Any]]:
         (f"%{team_name}%",),
     )
     return row
+
+
+def resolve_club_team_ids_all_leagues(team_name: str) -> Tuple[List[int], str]:
+    """
+    For tsdb_league_id == 0 (ALL leagues mode):
+
+    - If team_name belongs to an alias group, find ALL team_ids whose
+      normalised name matches any alias in that group.
+    - If nothing matches, fall back to a single global team lookup.
+    - Returns: (team_ids, representative_display_name).
+
+    This is *club → team_ids* logic. Everything else stays team_id-based.
+    """
+    alias_group = find_alias_group(team_name)
+    if alias_group:
+        group_norms = {normalise_name(x) for x in alias_group}
+
+        # Pull all teams and filter in Python to respect our normalisation rules
+        rows = fetch_all("SELECT id, name FROM teams")
+        club_rows: List[Dict[str, Any]] = [
+            r for r in rows if normalise_name(r["name"]) in group_norms
+        ]
+
+        if club_rows:
+            ids = [r["id"] for r in club_rows]
+            # Use the first DB name as "nice" display (e.g. 'Stormers' or 'DHL Stormers')
+            rep_name = club_rows[0]["name"]
+            return ids, rep_name
+
+    # Fallback: no alias group or nothing matched in DB → just pick one team globally
+    row = resolve_team_global(team_name)
+    if not row:
+        return [], team_name
+    return [row["id"]], row["name"]
 
 
 # ---------------------------------------------------------------------------
