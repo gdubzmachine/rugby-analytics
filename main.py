@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Rugby Analytics Backend – v0.8.0 (ID-based H2H with club alias groups)
+# Rugby Analytics Backend – v0.8.1 (ID-based H2H with club alias groups)
 
 """
 main.py
@@ -12,6 +12,7 @@ FastAPI app for rugby analytics:
 - /teams
 - /standings/{tsdb_league_id}
 - /headtohead/{tsdb_league_id}
+- /version
 - /         (built-in UI for head-to-head)
 
 This version:
@@ -25,13 +26,18 @@ This version:
       equals any of those aliases.
     - Queries matches using ONLY those team_ids (no name-based guessing).
 - Does NOT use substring logic on names to decide wins – only team_ids.
+- Exposes the backend version:
+    - in code (comment above),
+    - in FastAPI metadata (version="0.8.1"),
+    - on /version (JSON),
+    - and visually on the UI chip: "Rugby Analytics · v0.8.1".
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import os
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -43,6 +49,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 from dotenv import load_dotenv
 
+API_VERSION = "0.8.1"
 
 # ---------------------------------------------------------------------------
 # Environment / DB helpers
@@ -430,7 +437,7 @@ class TeamInfo(BaseModel):
 
 app = FastAPI(
     title="Rugby Analytics API",
-    version="0.8.0",
+    version=API_VERSION,
     description=(
         "Rugby analytics API (multi-league, ID-based head-to-head with "
         "club alias groups for query-time merging)."
@@ -620,6 +627,14 @@ def health_check() -> Dict[str, Any]:
             status_code=HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "detail": str(exc)},
         )
+
+
+@app.get("/version")
+def version() -> Dict[str, Any]:
+    """
+    Return the backend version string, so you can confirm deploys are live.
+    """
+    return {"version": API_VERSION}
 
 
 @app.get("/leagues", response_model=List[LeagueInfo])
@@ -989,7 +1004,7 @@ def head_to_head(
 # Built-in HTML UI (index page)
 # ---------------------------------------------------------------------------
 
-INDEX_HTML = """
+INDEX_HTML = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -997,7 +1012,7 @@ INDEX_HTML = """
   <title>Rugby Head-to-Head</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root {
+    :root {{
       color-scheme: dark;
       --bg: #0b1120;
       --bg-alt: #020617;
@@ -1010,13 +1025,13 @@ INDEX_HTML = """
       --shadow-soft: 0 18px 40px rgba(15, 23, 42, 0.85);
       --radius-xl: 20px;
       --radius-2xl: 24px;
-    }
+    }}
 
-    * {
+    * {{
       box-sizing: border-box;
-    }
+    }}
 
-    body {
+    body {{
       margin: 0;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
       background: radial-gradient(circle at top, #1e293b 0, #020617 55%, black 100%);
@@ -1026,9 +1041,9 @@ INDEX_HTML = """
       justify-content: center;
       align-items: center;
       padding: 24px;
-    }
+    }}
 
-    .app-shell {
+    .app-shell {{
       width: 100%;
       max-width: 1200px;
       background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.08), transparent 55%),
@@ -1042,9 +1057,9 @@ INDEX_HTML = """
       padding: 24px 24px 28px;
       position: relative;
       overflow: hidden;
-    }
+    }}
 
-    .app-shell::before {
+    .app-shell::before {{
       content: "";
       position: absolute;
       inset: 0;
@@ -1053,28 +1068,28 @@ INDEX_HTML = """
         radial-gradient(circle at bottom right, rgba(56,189,248,0.12), transparent 65%);
       opacity: 0.9;
       pointer-events: none;
-    }
+    }}
 
-    .app-shell-inner {
+    .app-shell-inner {{
       position: relative;
       z-index: 1;
-    }
+    }}
 
-    header {
+    header {{
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
       gap: 16px;
       margin-bottom: 24px;
-    }
+    }}
 
-    .brand {
+    .brand {{
       display: flex;
       align-items: center;
       gap: 14px;
-    }
+    }}
 
-    .logo-pill {
+    .logo-pill {{
       width: 40px;
       height: 40px;
       border-radius: 999px;
@@ -1084,9 +1099,9 @@ INDEX_HTML = """
       box-shadow:
         0 0 0 1px rgba(15,23,42,0.9),
         0 0 22px rgba(56,189,248,0.65);
-    }
+    }}
 
-    .logo-inner {
+    .logo-inner {{
       width: 100%;
       height: 100%;
       border-radius: inherit;
@@ -1096,9 +1111,9 @@ INDEX_HTML = """
       display: flex;
       align-items: center;
       justify-content: center;
-    }
+    }}
 
-    .logo-mark {
+    .logo-mark {{
       width: 20px;
       height: 20px;
       border-radius: 8px;
@@ -1107,32 +1122,32 @@ INDEX_HTML = """
       grid-template-columns: repeat(2, 1fr);
       gap: 1.5px;
       padding: 2px;
-    }
+    }}
 
-    .logo-mark span {
+    .logo-mark span {{
       border-radius: 3px;
       background: linear-gradient(135deg, rgba(56,189,248,0.8), rgba(14,165,233,0.35));
       box-shadow: 0 0 10px rgba(56,189,248,0.7);
-    }
+    }}
 
     .logo-mark span:nth-child(2),
-    .logo-mark span:nth-child(3) {
+    .logo-mark span:nth-child(3) {{
       background: linear-gradient(135deg, rgba(34,197,94,0.9), rgba(16,185,129,0.35));
-    }
+    }}
 
-    .brand-text {
+    .brand-text {{
       display: flex;
       flex-direction: column;
       gap: 4px;
-    }
+    }}
 
-    .brand-title {
+    .brand-title {{
       display: flex;
       align-items: baseline;
       gap: 7px;
-    }
+    }}
 
-    .brand-title h1 {
+    .brand-title h1 {{
       font-size: 22px;
       font-weight: 650;
       letter-spacing: 0.02em;
@@ -1140,47 +1155,47 @@ INDEX_HTML = """
       display: inline-flex;
       align-items: center;
       gap: 6px;
-    }
+    }}
 
-    .brand-chip {
+    .brand-chip {{
       font-size: 11px;
       padding: 4px 7px;
       border-radius: 999px;
       border: 1px solid rgba(148, 163, 184, 0.45);
       background: radial-gradient(circle at top, rgba(15,23,42,0.9), rgba(15,23,42,0.95));
       color: var(--text-muted);
-    }
+    }}
 
-    .brand-subtitle {
+    .brand-subtitle {{
       font-size: 12px;
       color: var(--text-muted);
       display: flex;
       gap: 10px;
       align-items: center;
-    }
+    }}
 
-    .brand-subtitle span {
+    .brand-subtitle span {{
       display: inline-flex;
       align-items: center;
       gap: 4px;
-    }
+    }}
 
-    .brand-subtitle svg {
+    .brand-subtitle svg {{
       width: 13px;
       height: 13px;
       opacity: 0.85;
-    }
+    }}
 
-    .meta {
+    .meta {{
       display: flex;
       flex-direction: column;
       align-items: flex-end;
       gap: 6px;
       font-size: 11px;
       color: var(--text-muted);
-    }
+    }}
 
-    .meta-row {
+    .meta-row {{
       display: inline-flex;
       gap: 6px;
       align-items: center;
@@ -1189,17 +1204,17 @@ INDEX_HTML = """
       border: 1px solid rgba(148, 163, 184, 0.4);
       background: radial-gradient(circle at top, rgba(15,23,42,0.9), rgba(15,23,42,0.98));
       backdrop-filter: blur(12px);
-    }
+    }}
 
-    .meta-dot {
+    .meta-dot {{
       width: 7px;
       height: 7px;
       border-radius: 999px;
       background: #22c55e;
       box-shadow: 0 0 10px rgba(34,197,94,0.9);
-    }
+    }}
 
-    .meta-pill {
+    .meta-pill {{
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -1207,24 +1222,24 @@ INDEX_HTML = """
       border-radius: 999px;
       background: radial-gradient(circle at top, rgba(15,23,42,0.95), rgba(15,23,42,1));
       border: 1px solid rgba(148, 163, 184, 0.5);
-    }
+    }}
 
-    .meta-pill strong {
+    .meta-pill strong {{
       font-weight: 600;
       color: #e5e7eb;
-    }
+    }}
 
-    .meta-pill span {
+    .meta-pill span {{
       color: var(--text-muted);
-    }
+    }}
 
-    main {
+    main {{
       display: grid;
       grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr);
       gap: 20px;
-    }
+    }}
 
-    .panel {
+    .panel {{
       background: radial-gradient(circle at top, rgba(15,23,42,0.96), rgba(15,23,42,0.99));
       border-radius: var(--radius-2xl);
       border: 1px solid rgba(148, 163, 184, 0.4);
@@ -1234,37 +1249,37 @@ INDEX_HTML = """
       padding: 16px 16px 18px;
       position: relative;
       overflow: hidden;
-    }
+    }}
 
-    .panel::before {
+    .panel::before {{
       content: "";
       position: absolute;
       inset: 0;
       background: radial-gradient(circle at top right, rgba(56,189,248,0.08), transparent 55%);
       opacity: 0.9;
       pointer-events: none;
-    }
+    }}
 
-    .panel-inner {
+    .panel-inner {{
       position: relative;
       z-index: 1;
-    }
+    }}
 
-    .panel-header {
+    .panel-header {{
       display: flex;
       align-items: center;
       justify-content: space-between;
       margin-bottom: 12px;
       gap: 10px;
-    }
+    }}
 
-    .panel-header-title {
+    .panel-header-title {{
       display: flex;
       flex-direction: column;
       gap: 2px;
-    }
+    }}
 
-    .panel-header-title h2 {
+    .panel-header-title h2 {{
       font-size: 14px;
       font-weight: 600;
       letter-spacing: 0.03em;
@@ -1273,63 +1288,63 @@ INDEX_HTML = """
       display: flex;
       align-items: center;
       gap: 8px;
-    }
+    }}
 
-    .panel-header-title h2 span.pill {
+    .panel-header-title h2 span.pill {{
       font-size: 10px;
       padding: 3px 7px;
       border-radius: 999px;
       border: 1px solid rgba(148, 163, 184, 0.6);
       background: rgba(15, 23, 42, 0.9);
       color: var(--text-muted);
-    }
+    }}
 
-    .panel-header-title p {
+    .panel-header-title p {{
       margin: 0;
       font-size: 11px;
       color: var(--text-muted);
-    }
+    }}
 
-    .panel-header-meta {
+    .panel-header-meta {{
       font-size: 11px;
       color: var(--text-muted);
       display: flex;
       flex-direction: column;
       align-items: flex-end;
       gap: 4px;
-    }
+    }}
 
-    .panel-header-meta span {
+    .panel-header-meta span {{
       padding: 3px 8px;
       border-radius: 999px;
       border: 1px solid rgba(148, 163, 184, 0.45);
       background: rgba(15,23,42,0.9);
-    }
+    }}
 
-    .form-grid {
+    .form-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr);
       gap: 10px;
       margin-bottom: 10px;
-    }
+    }}
 
-    .form-group {
+    .form-group {{
       display: flex;
       flex-direction: column;
       gap: 5px;
       font-size: 11px;
-    }
+    }}
 
-    label {
+    label {{
       color: var(--text-muted);
       font-weight: 500;
       letter-spacing: 0.02em;
       text-transform: uppercase;
-    }
+    }}
 
     select,
     input[type="text"],
-    input[type="number"] {
+    input[type="number"] {{
       width: 100%;
       padding: 7px 8px;
       border-radius: 10px;
@@ -1340,48 +1355,48 @@ INDEX_HTML = """
       outline: none;
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
       box-shadow: inset 0 0 0 1px rgba(15,23,42,0.85);
-    }
+    }}
 
     select:focus,
     input[type="text"]:focus,
-    input[type="number"]:focus {
+    input[type="number"]:focus {{
       border-color: var(--accent);
       box-shadow:
         0 0 0 1px rgba(56,189,248,0.6),
         0 0 0 1.5px rgba(15,23,42,1);
-    }
+    }}
 
     input[type="number"]::-webkit-inner-spin-button,
-    input[type="number"]::-webkit-outer-spin-button {
+    input[type="number"]::-webkit-outer-spin-button {{
       -webkit-appearance: none;
       margin: 0;
-    }
+    }}
 
-    .league-row {
+    .league-row {{
       display: grid;
       grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.3fr);
       gap: 10px;
-    }
+    }}
 
-    .alias-note {
+    .alias-note {{
       font-size: 11px;
       color: var(--text-muted);
       margin-top: 4px;
-    }
+    }}
 
-    .alias-note strong {
+    .alias-note strong {{
       color: #e5e7eb;
       font-weight: 500;
-    }
+    }}
 
-    .actions {
+    .actions {{
       display: flex;
       justify-content: flex-end;
       gap: 8px;
       margin-top: 10px;
-    }
+    }}
 
-    button {
+    button {{
       border-radius: 999px;
       border: 1px solid transparent;
       padding: 7px 12px;
@@ -1401,65 +1416,65 @@ INDEX_HTML = """
         box-shadow 0.08s ease-out,
         filter 0.12s ease-out;
       white-space: nowrap;
-    }
+    }}
 
-    button.secondary {
+    button.secondary {{
       background: rgba(15,23,42,0.95);
       color: var(--text-muted);
       border-color: rgba(148, 163, 184, 0.5);
       box-shadow:
         0 4px 16px rgba(15,23,42,0.9),
         inset 0 0 0 1px rgba(15,23,42,0.9);
-    }
+    }}
 
-    button:hover {
+    button:hover {{
       transform: translateY(-1px);
       filter: brightness(1.03);
       box-shadow:
         0 16px 35px rgba(56,189,248,0.75),
         0 0 0 1px rgba(15,23,42,0.9);
-    }
+    }}
 
-    button.secondary:hover {
+    button.secondary:hover {{
       box-shadow:
         0 10px 26px rgba(15,23,42,1),
         0 0 0 1px rgba(15,23,42,1);
       color: #e5e7eb;
-    }
+    }}
 
-    button:active {
+    button:active {{
       transform: translateY(0);
       box-shadow:
         0 8px 20px rgba(56,189,248,0.55),
         0 0 0 1px rgba(15,23,42,0.9);
-    }
+    }}
 
-    button.secondary:active {
+    button.secondary:active {{
       box-shadow:
         0 6px 16px rgba(15,23,42,1),
         0 0 0 1px rgba(15,23,42,1);
-    }
+    }}
 
-    button svg {
+    button svg {{
       width: 14px;
       height: 14px;
-    }
+    }}
 
-    .results-grid {
+    .results-grid {{
       display: grid;
       grid-template-rows: auto 1fr;
       gap: 12px;
       height: 100%;
-    }
+    }}
 
-    .score-summary {
+    .score-summary {{
       display: grid;
       grid-template-columns: 1.1fr 1.5fr;
       gap: 12px;
       align-items: stretch;
-    }
+    }}
 
-    .score-card {
+    .score-card {{
       border-radius: 18px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       background:
@@ -1471,42 +1486,42 @@ INDEX_HTML = """
       display: flex;
       flex-direction: column;
       gap: 7px;
-    }
+    }}
 
-    .score-header {
+    .score-header {{
       display: flex;
       justify-content: space-between;
       font-size: 11px;
       color: var(--text-muted);
       align-items: center;
-    }
+    }}
 
-    .score-teams {
+    .score-teams {{
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 10px;
-    }
+    }}
 
-    .team-block {
+    .team-block {{
       display: flex;
       flex-direction: column;
       gap: 3px;
       flex: 1;
-    }
+    }}
 
-    .team-name {
+    .team-name {{
       font-weight: 600;
       font-size: 14px;
       letter-spacing: 0.02em;
-    }
+    }}
 
-    .team-meta {
+    .team-meta {{
       font-size: 11px;
       color: var(--text-muted);
-    }
+    }}
 
-    .score-badge {
+    .score-badge {{
       display: inline-flex;
       align-items: baseline;
       gap: 4px;
@@ -1515,20 +1530,20 @@ INDEX_HTML = """
       border: 1px solid rgba(148, 163, 184, 0.5);
       background: radial-gradient(circle at top, rgba(15,23,42,1), rgba(15,23,42,1));
       font-size: 13px;
-    }
+    }}
 
-    .score-badge strong {
+    .score-badge strong {{
       font-size: 16px;
       font-weight: 650;
       color: #e5e7eb;
-    }
+    }}
 
-    .score-badge span {
+    .score-badge span {{
       color: var(--text-muted);
       font-size: 11px;
-    }
+    }}
 
-    .streak-pill {
+    .streak-pill {{
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -1539,21 +1554,21 @@ INDEX_HTML = """
       font-size: 11px;
       color: #bbf7d0;
       box-shadow: 0 0 18px rgba(34,197,94,0.45);
-    }
+    }}
 
-    .streak-pill svg {
+    .streak-pill svg {{
       width: 13px;
       height: 13px;
-    }
+    }}
 
-    .stats-grid {
+    .stats-grid {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px;
       margin-top: 4px;
-    }
+    }}
 
-    .stat-item {
+    .stat-item {{
       border-radius: 12px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       padding: 6px 8px;
@@ -1562,20 +1577,20 @@ INDEX_HTML = """
       display: flex;
       flex-direction: column;
       gap: 3px;
-    }
+    }}
 
-    .stat-item span.label {
+    .stat-item span.label {{
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.06em;
       font-size: 10px;
-    }
+    }}
 
-    .stat-item span.value {
+    .stat-item span.value {{
       font-weight: 600;
-    }
+    }}
 
-    .history-card {
+    .history-card {{
       border-radius: 18px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       padding: 10px 12px;
@@ -1587,80 +1602,80 @@ INDEX_HTML = """
       display: flex;
       flex-direction: column;
       gap: 8px;
-    }
+    }}
 
-    .history-header {
+    .history-header {{
       display: flex;
       justify-content: space-between;
       align-items: center;
       font-size: 11px;
       color: var(--text-muted);
-    }
+    }}
 
-    .history-header strong {
+    .history-header strong {{
       color: #e5e7eb;
       font-size: 12px;
       letter-spacing: 0.04em;
       text-transform: uppercase;
-    }
+    }}
 
-    .history-list {
+    .history-list {{
       border-radius: 12px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       max-height: 210px;
       overflow: hidden auto;
       background: rgba(15,23,42,0.95);
-    }
+    }}
 
-    table {
+    table {{
       width: 100%;
       border-collapse: collapse;
       font-size: 11px;
-    }
+    }}
 
-    thead {
+    thead {{
       position: sticky;
       top: 0;
       background: linear-gradient(to bottom, #020617, #020617);
       box-shadow: 0 1px 0 rgba(51, 65, 85, 0.9);
       z-index: 1;
-    }
+    }}
 
-    th, td {
+    th, td {{
       padding: 6px 8px;
       text-align: left;
       border-bottom: 1px solid rgba(30, 41, 59, 0.9);
       white-space: nowrap;
-    }
+    }}
 
-    th {
+    th {{
       color: var(--text-muted);
       font-weight: 500;
       text-transform: uppercase;
       letter-spacing: 0.08em;
       font-size: 10px;
-    }
+    }}
 
-    tbody tr:last-child td {
+    tbody tr:last-child td {{
       border-bottom: none;
-    }
+    }}
 
-    tbody tr:nth-child(even) {
+    tbody tr:nth-child(even) {{
       background-color: rgba(15,23,42, 0.9);
-    }
+    }}
 
-    tbody tr:hover {
+    tbody tr:hover {{
       background-color: rgba(30,64,175,0.4);
-    }
+    }}
 
-    .td-footnote {
+    .td-footnote {{
       font-size: 10px;
       color: var(--text-muted);
       white-space: normal;
       line-height: 1.4;
-    }
+    }}
 
-    .upcoming-card {
+    .upcoming-card {{
       border-radius: 18px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       padding: 10px 12px;
@@ -1672,17 +1687,17 @@ INDEX_HTML = """
       display: flex;
       flex-direction: column;
       gap: 8px;
-    }
+    }}
 
-    .upcoming-list {
+    .upcoming-list {{
       border-radius: 12px;
       border: 1px solid rgba(148, 163, 184, 0.4);
       background: rgba(15,23,42,0.96);
       max-height: 150px;
       overflow: hidden auto;
-    }
+    }}
 
-    .upcoming-item {
+    .upcoming-item {{
       padding: 6px 8px;
       border-bottom: 1px solid rgba(30, 41, 59, 0.85);
       display: flex;
@@ -1690,37 +1705,37 @@ INDEX_HTML = """
       align-items: center;
       gap: 6px;
       font-size: 11px;
-    }
+    }}
 
-    .upcoming-item:last-child {
+    .upcoming-item:last-child {{
       border-bottom: none;
-    }
+    }}
 
-    .upcoming-item-main {
+    .upcoming-item-main {{
       display: flex;
       flex-direction: column;
       gap: 3px;
-    }
+    }}
 
-    .upcoming-item-main strong {
+    .upcoming-item-main strong {{
       font-size: 11px;
-    }
+    }}
 
-    .upcoming-meta {
+    .upcoming-meta {{
       font-size: 10px;
       color: var(--text-muted);
-    }
+    }}
 
-    .upcoming-kickoff {
+    .upcoming-kickoff {{
       font-size: 11px;
       color: var(--text-muted);
       display: flex;
       flex-direction: column;
       align-items: flex-end;
       gap: 2px;
-    }
+    }}
 
-    .tag-chip {
+    .tag-chip {{
       display: inline-flex;
       align-items: center;
       gap: 5px;
@@ -1731,17 +1746,17 @@ INDEX_HTML = """
       font-size: 10px;
       color: var(--text-muted);
       white-space: nowrap;
-    }
+    }}
 
-    .tag-dot {
+    .tag-dot {{
       width: 6px;
       height: 6px;
       border-radius: 999px;
       background: #38bdf8;
       box-shadow: 0 0 8px rgba(56,189,248,0.8);
-    }
+    }}
 
-    .error-banner {
+    .error-banner {{
       margin-top: 8px;
       border-radius: 12px;
       border: 1px solid rgba(248, 113, 113, 0.6);
@@ -1752,69 +1767,69 @@ INDEX_HTML = """
       display: none;
       align-items: center;
       gap: 6px;
-    }
+    }}
 
-    .error-banner svg {
+    .error-banner svg {{
       width: 14px;
       height: 14px;
-    }
+    }}
 
-    .loading-indicator {
+    .loading-indicator {{
       display: none;
       font-size: 11px;
       color: var(--text-muted);
       align-items: center;
       gap: 6px;
       margin-top: 6px;
-    }
+    }}
 
-    .loading-indicator svg {
+    .loading-indicator svg {{
       width: 13px;
       height: 13px;
       animation: spin 1s linear infinite;
-    }
+    }}
 
-    @keyframes spin {
-      to {
+    @keyframes spin {{
+      to {{
         transform: rotate(360deg);
-      }
-    }
+      }}
+    }}
 
-    @media (max-width: 900px) {
-      main {
+    @media (max-width: 900px) {{
+      main {{
         grid-template-columns: minmax(0, 1fr);
-      }
+      }}
 
-      .app-shell {
+      .app-shell {{
         padding: 18px;
-      }
+      }}
 
-      .panel {
+      .panel {{
         padding: 14px 12px 16px;
-      }
+      }}
 
-      .score-summary {
+      .score-summary {{
         grid-template-columns: minmax(0, 1fr);
-      }
-    }
+      }}
+    }}
 
-    @media (max-width: 600px) {
-      header {
+    @media (max-width: 600px) {{
+      header {{
         flex-direction: column;
-      }
+      }}
 
-      .meta {
+      .meta {{
         align-items: flex-start;
-      }
+      }}
 
-      .form-grid {
+      .form-grid {{
         grid-template-columns: minmax(0, 1fr);
-      }
+      }}
 
-      .league-row {
+      .league-row {{
         grid-template-columns: minmax(0, 1fr);
-      }
-    }
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -1832,7 +1847,7 @@ INDEX_HTML = """
           <div class="brand-text">
             <div class="brand-title">
               <h1>Rugby Head-to-Head</h1>
-              <span class="brand-chip">Rugby Analytics · Beta</span>
+              <span class="brand-chip">Rugby Analytics · v{API_VERSION}</span>
             </div>
             <div class="brand-subtitle">
               <span>
@@ -1847,7 +1862,7 @@ INDEX_HTML = """
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path fill="currentColor" d="M12 2C7.58 2 4 3.79 4 6v12c0 2.21 3.58 4 8 4s8-1.79 8-4V6c0-2.21-3.58-4-8-4Zm0 2c3.31 0 6 .9 6 2s-2.69 2-6 2-6-.9-6-2 2.69-2 6-2Zm0 14c-3.31 0-6-.9-6-2v-2.09C7.09 16.56 9.42 17 12 17s4.91-.44 6-1.09V16c0 1.1-2.69 2-6 2Zm0-4c-3.31 0-6-.9-6-2v-2.09C7.09 12.56 9.42 13 12 13s4.91-.44 6-1.09V12c0 1.1-2.69 2-6 2Z" />
                 </svg>
-                Powered by Postgres & TheSportsDB
+                Backend v{API_VERSION} · ID-based alias H2H
               </span>
             </div>
           </div>
