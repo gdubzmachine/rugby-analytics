@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Rugby Analytics API – v1.0.2 (api.main, ID-based H2H, alias-aware, safe error reporting)
+# Rugby Analytics API – v1.0.3 (api.main, ID-based H2H, alias-aware, env debug + DB fallback)
 
 from __future__ import annotations
 
@@ -18,7 +18,29 @@ from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
-API_VERSION = "1.0.2"
+API_VERSION = "1.0.3"
+
+# ---------------------------------------------------------------------------
+# DB URL fallback (to get you unstuck)
+# ---------------------------------------------------------------------------
+
+# OPTION A (recommended): Set DATABASE_URL in Render environment.
+# OPTION B (temporary): Paste your full Postgres URL here so the app still works
+# even if the env var is missing.
+#
+# Example (REPLACE THIS PLACEHOLDER with your real URL):
+#   postgres://user:pass@host:port/dbname
+#
+# You told me your test URL was:
+#   postgresql://rugby_analytics_user:...@dpg-d4grdq.../rugby_analytics
+#
+# Paste that EXACT string below instead of "PASTE_YOUR_POSTGRES_URL_HERE"
+DEFAULT_DATABASE_URL = "PASTE_YOUR_POSTGRES_URL_HERE"
+
+# If you prefer, you can also set DATABASE_URL_FALLBACK as an env var
+# and leave DEFAULT_DATABASE_URL as-is:
+ENV_FALLBACK_URL = os.getenv("DATABASE_URL_FALLBACK")
+
 
 # ---------------------------------------------------------------------------
 # Env + DB helpers
@@ -27,11 +49,35 @@ API_VERSION = "1.0.2"
 load_dotenv()  # local dev; no-op on Render if env vars are set
 
 
+def get_effective_db_url() -> Optional[str]:
+    """
+    Decide which DB URL to use, in priority order:
+
+    1. DATABASE_URL from environment
+    2. DATABASE_URL_FALLBACK from environment (optional)
+    3. DEFAULT_DATABASE_URL constant in this file
+
+    Returns the URL string or None if none are configured.
+    """
+    env_url = os.getenv("DATABASE_URL")
+    if env_url:
+        return env_url
+
+    if ENV_FALLBACK_URL:
+        return ENV_FALLBACK_URL
+
+    if DEFAULT_DATABASE_URL and "PASTE_YOUR_POSTGRES_URL_HERE" not in DEFAULT_DATABASE_URL:
+        return DEFAULT_DATABASE_URL
+
+    return None
+
+
 def get_conn():
-    dsn = os.getenv("DATABASE_URL")
+    dsn = get_effective_db_url()
     if not dsn:
         raise RuntimeError(
-            "DATABASE_URL is not set. Configure it in .env (local) or as a Render env var."
+            "DATABASE_URL is not configured. "
+            "Set it as an env var in Render, or paste it into DEFAULT_DATABASE_URL in api/main.py."
         )
     return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
 
@@ -564,6 +610,34 @@ def version() -> Dict[str, Any]:
     return {"version": API_VERSION}
 
 
+@app.get("/debug-env")
+def debug_env() -> Dict[str, Any]:
+    """
+    Small helper so you can see what the app sees for DB URL.
+    Does NOT return the full URL, just whether it's set and a short prefix.
+    """
+    raw_env = os.getenv("DATABASE_URL")
+    effective = get_effective_db_url()
+    return {
+        "DATABASE_URL_set": bool(raw_env),
+        "DATABASE_URL_prefix": raw_env[:20] + "…" if raw_env else None,
+        "ENV_FALLBACK_URL_set": bool(ENV_FALLBACK_URL),
+        "DEFAULT_DATABASE_URL_configured": (
+            bool(DEFAULT_DATABASE_URL)
+            and "PASTE_YOUR_POSTGRES_URL_HERE" not in DEFAULT_DATABASE_URL
+        ),
+        "effective_url_source": (
+            "DATABASE_URL"
+            if raw_env
+            else "DATABASE_URL_FALLBACK"
+            if ENV_FALLBACK_URL
+            else "DEFAULT_DATABASE_URL"
+            if effective
+            else None
+        ),
+    }
+
+
 @app.get("/leagues", response_model=List[LeagueInfo])
 def list_leagues() -> List[LeagueInfo]:
     rows = fetch_all(
@@ -892,10 +966,8 @@ def head_to_head(
             upcoming_fixtures=upcoming_fixtures,
         )
     except HTTPException:
-        # re-raise HTTP errors as-is (404 for missing teams/league)
         raise
     except Exception as exc:
-        # This is the key: you now get a JSON message with the real error
         raise HTTPException(
             status_code=500,
             detail=f"H2H internal error: {exc}",
