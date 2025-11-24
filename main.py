@@ -1,270 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-main.py
-
-FastAPI app wiring for rugby analytics:
-
-- /health
-- /leagues
-- /teams
-- /standings/{tsdb_league_id}
-- /headtohead/{tsdb_league_id}
-- /         (built-in HTML UI)
-"""
-
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import Response
-from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
-
-from db import (
-    get_conn,
-    fetch_all,
-    fetch_one,
-    resolve_league_by_tsdb,
-    resolve_latest_season_for_league,
-    resolve_season_for_league_and_label,
-)
-from models import (
-    FixtureSummary,
-    HeadToHeadResponse,
-    LeagueInfo,
-    MatchSummary,
-    StandingRow,
-    StandingsResponse,
-    TeamInfo,
-)
-from h2h_helpers import (
-    build_fixture_summary_row,
-    build_match_summary_row,
-    compute_head_to_head_stats,
-    resolve_team_global,
-    resolve_team_in_league,
-    expand_team_ids_for_club,
-)
-from index_html import INDEX_HTML
-
-
-# ---------------------------------------------------------------------------
-# FastAPI app and CORS
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="Rugby Analytics API",
-    version="0.6.0",
-    description="Simple rugby analytics API (URC + multi-league head-to-head).",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Healthcheck
-# ---------------------------------------------------------------------------
-
-
-@app.get("/health")
-def health_check() -> Dict[str, Any]:
-    """
-    Simple health check endpoint.
-    """
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        return {"status": "ok"}
-    except Exception as exc:  # pragma: no cover
-        return JSONResponse(
-            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "error", "detail": str(exc)},
-        )
-
-
-# ---------------------------------------------------------------------------
-# Leagues / teams
-# ---------------------------------------------------------------------------
-
-
-@app.get("/leagues", response_model=List[LeagueInfo])
-def list_leagues() -> List[LeagueInfo]:
-    """
-    Return all leagues that have tsdb_league_id (i.e., rugby leagues catalogued).
-    """
-    rows = fetch_all(
-        """
-        SELECT id, name, country, tsdb_league_id
-        FROM leagues
-        WHERE tsdb_league_id IS NOT NULL
-        ORDER BY country NULLS LAST, name
-        """,
-        (),
-    )
-    return [LeagueInfo(**row) for row in rows]
-
-
-@app.get("/teams", response_model=List[TeamInfo])
-def list_teams(
-    league_id: Optional[int] = Query(
-        None,
-        description="Filter to a specific league_id. If omitted, returns all teams.",
-    )
-) -> List[TeamInfo]:
-    """
-    Return teams, optionally filtered by league_id.
-
-    If league_id is provided, we look at teams that have at least one season in that league.
-    """
-    if league_id is None:
-        rows = fetch_all(
-            """
-            SELECT t.id,
-                   t.name,
-                   NULL::integer AS league_id,
-                   NULL::text    AS league_name
-            FROM teams t
-            ORDER BY t.name
-            """,
-            (),
-        )
-    else:
-        rows = fetch_all(
-            """
-            SELECT DISTINCT
-                t.id,
-                t.name,
-                s.league_id,
-                l.name AS league_name
-            FROM teams t
-            JOIN league_team_seasons lts
-              ON lts.team_id = t.id
-            JOIN seasons s
-              ON s.id = lts.season_id
-            JOIN leagues l
-              ON l.id = s.league_id
-            WHERE s.league_id = %s
-            ORDER BY t.name
-            """,
-            (league_id,),
-        )
-
-    return [TeamInfo(**row) for row in rows]
-
-
-# ---------------------------------------------------------------------------
-# Standings
-# ---------------------------------------------------------------------------
-
-
-@app.get("/standings/{tsdb_league_id}", response_model=StandingsResponse)
-def get_standings(
-    tsdb_league_id: int,
-    season_label: Optional[str] = Query(
-        None,
-        description="Season label (e.g. '2023-2024'). If omitted, use the latest season.",
-    ),
-) -> StandingsResponse:
-    """
-    Returns league table standings for a given tsdb_league_id and season.
-    """
-    league = resolve_league_by_tsdb(tsdb_league_id)
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found")
-
-    league_id = league["id"]
-
-    if season_label:
-        season = resolve_season_for_league_and_label(league_id, season_label)
-        if not season:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Season '{season_label}' not found for league.",
-            )
-    else:
-        season = resolve_latest_season_for_league(league_id)
-        if not season:
-            raise HTTPException(
-                status_code=404,
-                detail="No seasons found for this league.",
-            )
-
-    season_id = season["id"]
-
-    rows = fetch_all(
-        """
-        SELECT
-            t.id AS team_id,
-            t.name AS team_name,
-            s.played,
-            s.wins,
-            s.draws,
-            s.losses,
-            s.points_for,
-            s.points_against,
-            s.points_diff,
-            s.tries_for,
-            s.tries_against,
-            s.league_points,
-            s.bonus_points
-        FROM team_season_stats s
-        JOIN teams t
-          ON t.id = s.team_id
-        WHERE s.season_id = %s
-        ORDER BY s.league_points DESC,
-                 s.points_diff DESC,
-                 t.name
-        """,
-        (season_id,),
-    )
-
-    standings: List[StandingRow] = []
-    for idx, row in enumerate(rows, start=1):
-        standings.append(
-            StandingRow(
-                position=idx,
-                team_id=row["team_id"],
-                team_name=row["team_name"],
-                played=row["played"],
-                wins=row["wins"],
-                draws=row["draws"],
-                losses=row["losses"],
-                points_for=row["points_for"],
-                points_against=row["points_against"],
-                points_diff=row["points_diff"],
-                tries_for=row["tries_for"],
-                tries_against=row["tries_against"],
-                league_points=row["league_points"],
-                bonus_points=row["bonus_points"],
-            )
-        )
-
-    return StandingsResponse(
-        league_id=league_id,
-        league_name=league["name"],
-        tsdb_league_id=tsdb_league_id,
-        season_id=season_id,
-        season_label=season["label"],
-        standings=standings,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Head-to-head
-# ---------------------------------------------------------------------------
-
-
 @app.get(
     "/headtohead/{tsdb_league_id}",
     response_model=HeadToHeadResponse,
@@ -290,7 +23,8 @@ def head_to_head(
     Head-to-head stats between two teams.
 
     If tsdb_league_id == 0, we allow matches across all leagues and
-    use alias groups to unify clubs across competitions.
+    use alias groups to unify clubs across competitions. In that mode
+    we match by team name patterns (ILIKE) rather than numeric IDs.
     """
     league = None
     league_id = None
@@ -303,7 +37,7 @@ def head_to_head(
         league_id = league["id"]
         league_name = league["name"]
 
-    # Resolve teams
+    # Resolve canonical teams for display
     if tsdb_league_id == 0:
         team_a_row = resolve_team_global(team_a)
         team_b_row = resolve_team_global(team_b)
@@ -319,17 +53,17 @@ def head_to_head(
     team_a_id = team_a_row["id"]
     team_b_id = team_b_row["id"]
 
-    # In "all leagues" mode, expand each club to all alias team IDs
-    if tsdb_league_id == 0:
-        team_a_ids = expand_team_ids_for_club(team_a_id, team_a_row["name"])
-        team_b_ids = expand_team_ids_for_club(team_b_id, team_b_row["name"])
-    else:
-        team_a_ids = [team_a_id]
-        team_b_ids = [team_b_id]
+    # Build alias-aware patterns/tokens
+    from h2h_helpers import build_name_patterns, build_alias_tokens  # local import to avoid cycles
+
+    team_a_patterns = build_name_patterns(team_a_row["name"])
+    team_b_patterns = build_name_patterns(team_b_row["name"])
+    team_a_tokens = build_alias_tokens(team_a_row["name"])
+    team_b_tokens = build_alias_tokens(team_b_row["name"])
 
     # ---- Played matches ----
     if tsdb_league_id == 0:
-        # Any league, alias-aware
+        # All leagues, alias-aware name matching
         rows = fetch_all(
             """
             SELECT
@@ -355,16 +89,16 @@ def head_to_head(
               ON l.id = m.league_id
             WHERE
               (
-                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
-                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+                (h.name ILIKE ANY(%s) AND a.name ILIKE ANY(%s)) OR
+                (h.name ILIKE ANY(%s) AND a.name ILIKE ANY(%s))
               )
             ORDER BY m.kickoff_utc DESC
             LIMIT %s
             """,
-            (team_a_ids, team_b_ids, team_b_ids, team_a_ids, limit),
+            (team_a_patterns, team_b_patterns, team_b_patterns, team_a_patterns, limit),
         )
     else:
-        # Single league, simple IDs + league filter
+        # Single league, plain IDs but still stats will use alias tokens
         rows = fetch_all(
             """
             SELECT
@@ -427,13 +161,13 @@ def head_to_head(
               ON l.id = m.league_id
             WHERE
               (
-                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
-                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+                (h.name ILIKE ANY(%s) AND a.name ILIKE ANY(%s)) OR
+                (h.name ILIKE ANY(%s) AND a.name ILIKE ANY(%s))
               )
               AND m.kickoff_utc >= NOW()
             ORDER BY m.kickoff_utc ASC
             """,
-            (team_a_ids, team_b_ids, team_b_ids, team_a_ids),
+            (team_a_patterns, team_b_patterns, team_b_patterns, team_a_patterns),
         )
     else:
         upcoming_rows = fetch_all(
@@ -471,8 +205,13 @@ def head_to_head(
 
     upcoming_fixtures = [build_fixture_summary_row(r) for r in upcoming_rows]
 
+    # Stats (uses alias tokens so Bulls/Blue Bulls and Stormers/WP are grouped)
     stats = compute_head_to_head_stats(
-        last_matches, team_a_row["name"], team_b_row["name"]
+        last_matches,
+        team_a_row["name"],
+        team_b_row["name"],
+        team_a_tokens,
+        team_b_tokens,
     )
 
     return HeadToHeadResponse(
@@ -494,16 +233,3 @@ def head_to_head(
         last_matches=last_matches,
         upcoming_fixtures=upcoming_fixtures,
     )
-
-
-# ---------------------------------------------------------------------------
-# Built-in HTML UI (index page)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> Response:
-    """
-    Serve the built-in head-to-head UI.
-    """
-    return HTMLResponse(content=INDEX_HTML)
