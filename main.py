@@ -46,6 +46,7 @@ from h2h_helpers import (
     compute_head_to_head_stats,
     resolve_team_global,
     resolve_team_in_league,
+    expand_team_ids_for_club,
 )
 from index_html import INDEX_HTML
 
@@ -302,6 +303,7 @@ def head_to_head(
         league_id = league["id"]
         league_name = league["name"]
 
+    # Resolve teams
     if tsdb_league_id == 0:
         team_a_row = resolve_team_global(team_a)
         team_b_row = resolve_team_global(team_b)
@@ -317,88 +319,155 @@ def head_to_head(
     team_a_id = team_a_row["id"]
     team_b_id = team_b_row["id"]
 
-    params: List[Any] = [team_a_id, team_b_id, team_b_id, team_a_id]
-    league_filter = ""
+    # In "all leagues" mode, expand each club to all alias team IDs
+    if tsdb_league_id == 0:
+        team_a_ids = expand_team_ids_for_club(team_a_id, team_a_row["name"])
+        team_b_ids = expand_team_ids_for_club(team_b_id, team_b_row["name"])
+    else:
+        team_a_ids = [team_a_id]
+        team_b_ids = [team_b_id]
 
-    if tsdb_league_id != 0:
-        league_filter = " AND m.league_id = %s"
-        params.append(league_id)
-
-    rows = fetch_all(
-        f"""
-        SELECT
-            m.id AS match_id,
-            m.kickoff_utc,
-            h.name AS home_team,
-            a.name AS away_team,
-            m.home_score,
-            m.away_score,
-            v.name AS venue,
-            l.name AS league,
-            s.label AS season
-        FROM matches m
-        JOIN teams h
-          ON h.id = m.home_team_id
-        JOIN teams a
-          ON a.id = m.away_team_id
-        LEFT JOIN venues v
-          ON v.id = m.venue_id
-        LEFT JOIN seasons s
-          ON s.id = m.season_id
-        LEFT JOIN leagues l
-          ON l.id = m.league_id
-        WHERE
-          (
-            (m.home_team_id = %s AND m.away_team_id = %s) OR
-            (m.home_team_id = %s AND m.away_team_id = %s)
-          )
-          {league_filter}
-        ORDER BY m.kickoff_utc DESC
-        LIMIT %s
-        """,
-        tuple(params + [limit]),
-    )
+    # ---- Played matches ----
+    if tsdb_league_id == 0:
+        # Any league, alias-aware
+        rows = fetch_all(
+            """
+            SELECT
+                m.id AS match_id,
+                m.kickoff_utc,
+                h.name AS home_team,
+                a.name AS away_team,
+                m.home_score,
+                m.away_score,
+                v.name AS venue,
+                l.name AS league,
+                s.label AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+              )
+            ORDER BY m.kickoff_utc DESC
+            LIMIT %s
+            """,
+            (team_a_ids, team_b_ids, team_b_ids, team_a_ids, limit),
+        )
+    else:
+        # Single league, simple IDs + league filter
+        rows = fetch_all(
+            """
+            SELECT
+                m.id AS match_id,
+                m.kickoff_utc,
+                h.name AS home_team,
+                a.name AS away_team,
+                m.home_score,
+                m.away_score,
+                v.name AS venue,
+                l.name AS league,
+                s.label AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = %s AND m.away_team_id = %s) OR
+                (m.home_team_id = %s AND m.away_team_id = %s)
+              )
+              AND m.league_id = %s
+            ORDER BY m.kickoff_utc DESC
+            LIMIT %s
+            """,
+            (team_a_id, team_b_id, team_b_id, team_a_id, league_id, limit),
+        )
 
     last_matches = [build_match_summary_row(r) for r in rows]
 
-    upcoming_params: List[Any] = [team_a_id, team_b_id, team_b_id, team_a_id]
-    upcoming_league_filter = ""
-    if tsdb_league_id != 0:
-        upcoming_league_filter = " AND m.league_id = %s"
-        upcoming_params.append(league_id)
-
-    upcoming_rows = fetch_all(
-        f"""
-        SELECT
-            m.id AS match_id,
-            m.kickoff_utc,
-            h.name AS home_team,
-            a.name AS away_team,
-            v.name AS venue,
-            l.name AS league,
-            s.label AS season
-        FROM matches m
-        JOIN teams h
-          ON h.id = m.home_team_id
-        JOIN teams a
-          ON a.id = m.away_team_id
-        LEFT JOIN venues v
-          ON v.id = m.venue_id
-        LEFT JOIN seasons s
-          ON s.id = m.season_id
-        LEFT JOIN leagues l
-          ON l.id = m.league_id
-        WHERE
-          (
-            (m.home_team_id = %s AND m.away_team_id = %s) OR
-            (m.home_team_id = %s AND m.away_team_id = %s)
-          )
-          {upcoming_league_filter}
-          AND m.kickoff_utc >= NOW()
-        ORDER BY m.kickoff_utc ASC
-        """,
-        tuple(upcoming_params),
-    )
+    # ---- Upcoming fixtures ----
+    if tsdb_league_id == 0:
+        upcoming_rows = fetch_all(
+            """
+            SELECT
+                m.id AS match_id,
+                m.kickoff_utc,
+                h.name AS home_team,
+                a.name AS away_team,
+                v.name AS venue,
+                l.name AS league,
+                s.label AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s)) OR
+                (m.home_team_id = ANY(%s) AND m.away_team_id = ANY(%s))
+              )
+              AND m.kickoff_utc >= NOW()
+            ORDER BY m.kickoff_utc ASC
+            """,
+            (team_a_ids, team_b_ids, team_b_ids, team_a_ids),
+        )
+    else:
+        upcoming_rows = fetch_all(
+            """
+            SELECT
+                m.id AS match_id,
+                m.kickoff_utc,
+                h.name AS home_team,
+                a.name AS away_team,
+                v.name AS venue,
+                l.name AS league,
+                s.label AS season
+            FROM matches m
+            JOIN teams h
+              ON h.id = m.home_team_id
+            JOIN teams a
+              ON a.id = m.away_team_id
+            LEFT JOIN venues v
+              ON v.id = m.venue_id
+            LEFT JOIN seasons s
+              ON s.id = m.season_id
+            LEFT JOIN leagues l
+              ON l.id = m.league_id
+            WHERE
+              (
+                (m.home_team_id = %s AND m.away_team_id = %s) OR
+                (m.home_team_id = %s AND m.away_team_id = %s)
+              )
+              AND m.league_id = %s
+              AND m.kickoff_utc >= NOW()
+            ORDER BY m.kickoff_utc ASC
+            """,
+            (team_a_id, team_b_id, team_b_id, team_a_id, league_id),
+        )
 
     upcoming_fixtures = [build_fixture_summary_row(r) for r in upcoming_rows]
 
