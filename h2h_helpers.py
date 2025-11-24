@@ -3,37 +3,83 @@
 """
 h2h_helpers.py
 
-Helpers for head-to-head logic:
+Shared helpers for Rugby Analytics:
 
-- club alias groups
-- name normalisation / fuzzy matching
-- global and league-scoped team resolution
-- match summary builders
-- head-to-head stats computation
-- alias substrings for "all leagues" mode
+- DB connection & simple query helpers
+- club alias groups (Bulls / Blue Bulls, Stormers / WP, etc.)
+- name normalisation / alias-group resolution
+- league & season resolution
+- team resolution (global + per-league)
+- core head-to-head stats computation (ID-based)
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, Iterable, List, Optional, Set
+import os
+import datetime as dt
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from db import fetch_one, fetch_all
-from models import FixtureSummary, MatchSummary
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+# Load env for local dev (.env); no-op on Render
+load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+
+def get_conn():
+    """
+    Open a Postgres connection using the DATABASE_URL environment variable.
+    """
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Configure it in your .env for local dev, "
+            "or as a Render env var in production."
+        )
+    return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
+
+
+def fetch_one(query: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    """Run a query that returns a single row (or None)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+    return row
+
+
+def fetch_all(query: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    """Run a query that returns multiple rows."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+    return list(rows)
 
 
 # ---------------------------------------------------------------------------
 # "Club" alias groups (Stormers + Western Province, etc.)
+# Used ONLY to decide which team_ids to include in queries.
+# Stats & results are purely team_id-based.
 # ---------------------------------------------------------------------------
 
 # Each set is a group of names that should be treated as the SAME club
 # when tsdb_league_id == 0 (ALL leagues mode).
-CLUB_ALIAS_GROUPS = [
-    {"stormers", "western province"},
-    {"bulls", "blue bulls"},
-    {"sharks", "natal sharks"},
-    {"lions", "golden lions"},
-    {"cheetahs", "free state cheetahs"},
+CLUB_ALIAS_GROUPS: List[Set[str]] = [
+    # South African clubs – extended aliases as requested
+    {"bulls", "blue bulls", "northern transvaal", "vodacom bulls", "pretoria bulls"},
+    {"stormers", "western province", "wp", "western stormers", "dhl stormers"},
+    {"sharks", "natal sharks", "natal", "sharks xv", "cell c sharks", "hollywoodbets sharks"},
+    {"lions", "golden lions", "emirates lions", "mtn golden lions", "transvaal"},
+    {"cheetahs", "free state cheetahs", "toyota cheetahs"},
+
+    # Existing groups for other clubs / competitions
     {"munster"},
     {"leinster"},
     {"ulster"},
@@ -91,17 +137,22 @@ CLUB_ALIAS_GROUPS = [
 
 def normalise_name(name: str) -> str:
     """
-    Lowercase and strip punctuation-ish noise for fuzzy matching.
+    Lowercase and strip punctuation-ish noise for equality matching.
     """
+    import re
+
     name = name.lower()
     name = re.sub(r"[^\w\s]", "", name)  # remove punctuation
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
 
-def find_alias_group(name: str) -> Optional[Iterable[str]]:
+def find_alias_group(name: str) -> Optional[Set[str]]:
     """
-    Return the alias group that contains `name`, or None.
+    Return the alias group that contains `name` (by normalised equality), or None.
+
+    This is used to decide *which club* a query like "Stormers" or "WP"
+    refers to. It does NOT do substring checks; we want to be conservative.
     """
     norm = normalise_name(name)
     for group in CLUB_ALIAS_GROUPS:
@@ -110,68 +161,102 @@ def find_alias_group(name: str) -> Optional[Iterable[str]]:
     return None
 
 
-def build_name_patterns(name: str) -> List[str]:
+def resolve_club_team_ids_all_leagues(team_name: str) -> Tuple[List[int], str]:
     """
-    Build ILIKE patterns for SQL matching of a club:
+    For tsdb_league_id == 0 (ALL leagues mode):
 
-    - includes the exact input name
-    - includes any aliases in the group
-    - patterns are like '%stormers%', '%western province%', '%bulls%', etc.
+    - If team_name belongs to an alias group, find ALL team_ids whose
+      normalised name matches any alias in that group.
+    - If nothing matches, fall back to a single global team lookup.
+    - Returns: (team_ids, representative_display_name).
+
+    This is *club → team_ids* logic. Everything else stays team_id-based.
     """
-    aliases: Set[str] = set()
-    aliases.add(name)
-    group = find_alias_group(name)
-    if group:
-        aliases.update(group)
+    alias_group = find_alias_group(team_name)
+    if alias_group:
+        group_norms = {normalise_name(x) for x in alias_group}
 
-    patterns = []
-    for alias in aliases:
-        alias = alias.strip()
-        if not alias:
-            continue
-        patterns.append(f"%{alias}%")
-    return patterns or [f"%{name}%"]
+        rows = fetch_all("SELECT id, name FROM teams")
+        club_rows: List[Dict[str, Any]] = [
+            r for r in rows if normalise_name(r["name"]) in group_norms
+        ]
 
+        if club_rows:
+            ids = [r["id"] for r in club_rows]
+            # Use the first DB name as "nice" display (e.g. 'Stormers' or 'DHL Stormers')
+            rep_name = club_rows[0]["name"]
+            return ids, rep_name
 
-def build_alias_tokens(name: str) -> List[str]:
-    """
-    Build lowercase substrings used to decide which side is which in stats:
-
-    We do substring checks on team names like 'Vodacom Bulls', 'DHL Stormers', etc.
-    """
-    tokens: Set[str] = set()
-
-    def add_token(s: str) -> None:
-        s = s.strip().lower()
-        if s:
-            tokens.add(s)
-
-    add_token(name)
-    group = find_alias_group(name)
-    if group:
-        for g in group:
-            add_token(g)
-
-    # Also add the last word (e.g. 'bulls', 'stormers') if multi-word
-    for t in list(tokens):
-        parts = t.split()
-        if len(parts) > 1:
-            add_token(parts[-1])
-
-    return sorted(tokens)
+    # Fallback: no alias group or nothing matched in DB → just pick one team globally
+    row = resolve_team_global(team_name)
+    if not row:
+        return [], team_name
+    return [row["id"]], row["name"]
 
 
 # ---------------------------------------------------------------------------
-# Team resolution
+# League / season / team resolution helpers
 # ---------------------------------------------------------------------------
+
+
+def resolve_league_by_tsdb(tsdb_league_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Resolve an internal league row by tsdb_league_id.
+    """
+    row = fetch_one(
+        """
+        SELECT id, name, tsdb_league_id
+        FROM leagues
+        WHERE tsdb_league_id = %s
+        """,
+        (tsdb_league_id,),
+    )
+    return row
+
+
+def resolve_latest_season_for_league(league_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Return the most recent season row for a given league.
+    """
+    row = fetch_one(
+        """
+        SELECT id, label, year, start_date, end_date
+        FROM seasons
+        WHERE league_id = %s
+        ORDER BY start_date DESC NULLS LAST, year DESC
+        LIMIT 1
+        """,
+        (league_id,),
+    )
+    return row
+
+
+def resolve_season_for_league_and_label(
+    league_id: int,
+    season_label: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolve a season row by league_id and label (e.g. '2023-2024' or '2024').
+    """
+    row = fetch_one(
+        """
+        SELECT id, label, year, start_date, end_date
+        FROM seasons
+        WHERE league_id = %s
+          AND label = %s
+        LIMIT 1
+        """,
+        (league_id, season_label),
+    )
+    return row
 
 
 def resolve_team_in_league(league_id: int, team_name: str) -> Optional[Dict[str, Any]]:
     """
     Resolve a team by name within a specific league:
 
-    1. Try exact LOWER(name) match
-    2. Then try ILIKE %name%
+    - tries exact LOWER(name) match
+    - then ILIKE %name%
     """
     row = fetch_one(
         """
@@ -211,29 +296,12 @@ def resolve_team_in_league(league_id: int, team_name: str) -> Optional[Dict[str,
 
 def resolve_team_global(team_name: str) -> Optional[Dict[str, Any]]:
     """
-    Global team resolve for tsdb_league_id == 0 mode.
+    Simpler global team resolve.
 
     We try:
-    - alias group match on normalised names
     - direct LOWER(name) match
-    - ILIKE %name%
+    - then ILIKE %name%
     """
-    alias_group = find_alias_group(team_name)
-
-    if alias_group:
-        placeholders = ", ".join(["LOWER(%s)"] * len(alias_group))
-        params = tuple(alias_group)
-        query = f"""
-            SELECT id, name
-            FROM teams
-            WHERE LOWER(name) IN ({placeholders})
-            ORDER BY name
-            LIMIT 1
-        """
-        row = fetch_one(query, params)
-        if row:
-            return row
-
     row = fetch_one(
         """
         SELECT id, name
@@ -261,107 +329,67 @@ def resolve_team_global(team_name: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Row builders
+# Core head-to-head stats (ID-based)
 # ---------------------------------------------------------------------------
 
 
-def build_match_summary_row(row: Dict[str, Any]) -> MatchSummary:
-    """
-    Convert DB row into MatchSummary.
-    """
-    return MatchSummary(
-        match_id=row["match_id"],
-        kickoff_utc=row["kickoff_utc"],
-        home_team=row["home_team"],
-        away_team=row["away_team"],
-        home_score=row.get("home_score"),
-        away_score=row.get("away_score"),
-        venue=row.get("venue"),
-        league=row.get("league"),
-        season=row.get("season"),
-    )
-
-
-def build_fixture_summary_row(row: Dict[str, Any]) -> FixtureSummary:
-    """
-    Convert DB row into FixtureSummary.
-    """
-    return FixtureSummary(
-        match_id=row["match_id"],
-        kickoff_utc=row["kickoff_utc"],
-        home_team=row["home_team"],
-        away_team=row["away_team"],
-        venue=row.get("venue"),
-        league=row.get("league"),
-        season=row.get("season"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stats computation
-# ---------------------------------------------------------------------------
-
-
-def compute_head_to_head_stats(
-    matches: List[MatchSummary],
+def compute_head_to_head_stats_from_rows(
+    rows: List[Dict[str, Any]],
+    team_a_ids: Set[int],
+    team_b_ids: Set[int],
     team_a_name: str,
     team_b_name: str,
-    team_a_tokens: List[str],
-    team_b_tokens: List[str],
 ) -> Dict[str, Any]:
     """
-    Compute win/draw counts, win rates, and current streak.
+    Compute win/draw counts, win rates, and current streak from raw DB rows.
 
-    We treat a side as "Team A" if its name contains any of team_a_tokens
-    (case-insensitive substring), likewise for Team B.
+    IMPORTANT:
+    - We only look at **team_ids** to decide which side is Team A / Team B.
+    - No name-based substring matching.
     """
+
     total = 0
     team_a_wins = 0
     team_b_wins = 0
     draws = 0
 
-    def is_team_a(name: str) -> bool:
-        n = name.lower()
-        return any(tok in n for tok in team_a_tokens)
+    for r in rows:
+        home_id = r["home_team_id"]
+        away_id = r["away_team_id"]
+        home_score = r.get("home_score")
+        away_score = r.get("away_score")
 
-    def is_team_b(name: str) -> bool:
-        n = name.lower()
-        return any(tok in n for tok in team_b_tokens)
-
-    for m in matches:
-        if m.home_score is None or m.away_score is None:
+        # Skip fixtures with no scores yet
+        if home_score is None or away_score is None:
             continue
 
-        home_name = m.home_team or ""
-        away_name = m.away_team or ""
+        a_home = home_id in team_a_ids
+        a_away = away_id in team_a_ids
+        b_home = home_id in team_b_ids
+        b_away = away_id in team_b_ids
 
-        a_home = is_team_a(home_name)
-        a_away = is_team_a(away_name)
-        b_home = is_team_b(home_name)
-        b_away = is_team_b(away_name)
-
-        # Must involve both clubs
+        # Must involve both clubs somewhere
         if not ((a_home or a_away) and (b_home or b_away)):
             continue
 
         total += 1
 
-        if m.home_score > m.away_score:
-            winner_side = "home"
-        elif m.home_score < m.away_score:
-            winner_side = "away"
+        if home_score > away_score:
+            winner = "home"
+        elif home_score < away_score:
+            winner = "away"
         else:
-            winner_side = None
+            winner = None
 
-        if winner_side is None:
+        if winner is None:
             draws += 1
         else:
-            if winner_side == "home":
+            if winner == "home":
                 if a_home:
                     team_a_wins += 1
                 elif b_home:
                     team_b_wins += 1
-            else:
+            else:  # away
                 if a_away:
                     team_a_wins += 1
                 elif b_away:
@@ -374,31 +402,29 @@ def compute_head_to_head_stats(
     team_b_rate = _rate(team_b_wins)
     draw_rate = _rate(draws)
 
-    # Current streak = most recent match in list that involves both clubs
-    current_streak = None
-    for m in matches:
-        if m.home_score is None or m.away_score is None:
+    # Current streak = most recent match in rows that involves both clubs
+    current_streak: Optional[str] = None
+    for r in rows:
+        home_id = r["home_team_id"]
+        away_id = r["away_team_id"]
+        home_score = r.get("home_score")
+        away_score = r.get("away_score")
+
+        if home_score is None or away_score is None:
             continue
 
-        home_name = m.home_team or ""
-        away_name = m.away_team or ""
-
-        a_home = is_team_a(home_name)
-        a_away = is_team_a(away_name)
-        b_home = is_team_b(home_name)
-        b_away = is_team_b(away_name)
+        a_home = home_id in team_a_ids
+        a_away = away_id in team_a_ids
+        b_home = home_id in team_b_ids
+        b_away = away_id in team_b_ids
 
         if not ((a_home or a_away) and (b_home or b_away)):
             continue
 
-        if m.home_score == m.away_score:
+        if home_score == away_score:
             current_streak = "Draw"
         else:
-            if m.home_score > m.away_score:
-                winner_is_home = True
-            else:
-                winner_is_home = False
-
+            winner_is_home = home_score > away_score
             if winner_is_home:
                 if a_home:
                     current_streak = f"{team_a_name} win"
